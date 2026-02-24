@@ -1,0 +1,3 @@
+[workspace]
+members = ["steamdepot", "steamdepot-cli"]
+resolver = "2"

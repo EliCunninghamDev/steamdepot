@@ -1,0 +1,11 @@
+[package]
+name = "steamdepot-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+steamdepot = { path = "../steamdepot" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
