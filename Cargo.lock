@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "steamdepot"
-version = "0.3.8"
+version = "0.3.10"
 dependencies = [
  "aes",
  "base64",
@@ -1662,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "steamdepot-cli"
-version = "0.3.8"
+version = "0.3.10"
 dependencies = [
  "clap",
  "reqwest",
