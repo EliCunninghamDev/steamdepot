@@ -4,9 +4,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-/// Minimal SMTP server that extracts Steam Guard codes from incoming emails.
+/// Item extracted from a Steam email.
+#[derive(Debug, Clone)]
+pub enum SteamMailItem {
+    /// A 5-character Steam Guard code.
+    GuardCode(String),
+    /// A verification/confirmation URL from Steam.
+    VerificationLink(String),
+}
+
+/// Minimal SMTP server that extracts Steam Guard codes and verification links
+/// from incoming emails.
 pub struct SteamMailServer {
-    code_rx: mpsc::Receiver<String>,
+    item_rx: mpsc::Receiver<SteamMailItem>,
     local_addr: SocketAddr,
 }
 
@@ -18,7 +28,7 @@ impl SteamMailServer {
     pub async fn new(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
-        let (code_tx, code_rx) = mpsc::channel(16);
+        let (item_tx, item_rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
             loop {
@@ -26,14 +36,14 @@ impl SteamMailServer {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let tx = code_tx.clone();
+                let tx = item_tx.clone();
                 tokio::spawn(async move {
                     let _ = handle_smtp(stream, tx).await;
                 });
             }
         });
 
-        Ok(Self { code_rx, local_addr })
+        Ok(Self { item_rx, local_addr })
     }
 
     /// The local address this server is bound to.
@@ -41,15 +51,39 @@ impl SteamMailServer {
         self.local_addr
     }
 
+    /// Wait for the next item (guard code or verification link) from an email.
+    pub async fn recv(&mut self) -> Option<SteamMailItem> {
+        self.item_rx.recv().await
+    }
+
     /// Wait for the next Steam Guard code to arrive via email.
+    ///
+    /// Skips any non-code items (e.g. verification links).
     pub async fn recv_code(&mut self) -> Option<String> {
-        self.code_rx.recv().await
+        loop {
+            match self.item_rx.recv().await? {
+                SteamMailItem::GuardCode(code) => return Some(code),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Wait for the next verification link to arrive via email.
+    ///
+    /// Skips any non-link items (e.g. guard codes).
+    pub async fn recv_link(&mut self) -> Option<String> {
+        loop {
+            match self.item_rx.recv().await? {
+                SteamMailItem::VerificationLink(url) => return Some(url),
+                _ => continue,
+            }
+        }
     }
 }
 
 async fn handle_smtp(
     stream: tokio::net::TcpStream,
-    code_tx: mpsc::Sender<String>,
+    item_tx: mpsc::Sender<SteamMailItem>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -63,8 +97,11 @@ async fn handle_smtp(
         if in_data {
             if line == "." {
                 in_data = false;
+                // Try guard code first, then verification link
                 if let Some(code) = extract_guard_code(&body) {
-                    let _ = code_tx.send(code).await;
+                    let _ = item_tx.send(SteamMailItem::GuardCode(code)).await;
+                } else if let Some(url) = extract_verification_link(&body) {
+                    let _ = item_tx.send(SteamMailItem::VerificationLink(url)).await;
                 }
                 body.clear();
                 writer.write_all(b"250 OK\r\n").await?;
@@ -99,6 +136,31 @@ async fn handle_smtp(
     }
 
     Ok(())
+}
+
+/// Extract a Steam verification/confirmation link from an email body.
+///
+/// Looks for URLs from `store.steampowered.com` or `help.steampowered.com`
+/// that contain common verification path segments.
+fn extract_verification_link(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        // Look for Steam URLs — could be in HTML href or plain text
+        for segment in trimmed.split(|c: char| c == '"' || c == '\'' || c == ' ' || c == '<' || c == '>') {
+            let s = segment.trim();
+            if (s.starts_with("https://store.steampowered.com/")
+                || s.starts_with("https://help.steampowered.com/")
+                || s.starts_with("https://login.steampowered.com/"))
+                && (s.contains("verify") || s.contains("confirm") || s.contains("newaccountverification")
+                    || s.contains("login/emailconf") || s.contains("creationconfirm"))
+            {
+                // Trim any trailing HTML/punctuation
+                let url = s.trim_end_matches(|c: char| c == '"' || c == '\'' || c == '>' || c == ';');
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Extract a 5-character alphanumeric Steam Guard code from an email body.
@@ -155,6 +217,48 @@ mod tests {
     fn no_code_found() {
         let body = "Hello, this is a regular email with no code.";
         assert_eq!(extract_guard_code(body), None);
+    }
+
+    #[test]
+    fn extract_verification_link_plain() {
+        let body = "Click here to verify your email:\nhttps://store.steampowered.com/newaccountverification?stoken=abc123&creationid=456\n\nThanks.";
+        assert_eq!(
+            extract_verification_link(body),
+            Some("https://store.steampowered.com/newaccountverification?stoken=abc123&creationid=456".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_verification_link_html() {
+        let body = r#"<a href="https://store.steampowered.com/creationconfirm?token=xyz">Verify</a>"#;
+        assert_eq!(
+            extract_verification_link(body),
+            Some("https://store.steampowered.com/creationconfirm?token=xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_verification_link_login_emailconf() {
+        let body = "https://login.steampowered.com/login/emailconf?token=abc";
+        assert_eq!(
+            extract_verification_link(body),
+            Some("https://login.steampowered.com/login/emailconf?token=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_verification_link_real_format() {
+        let body = "Click below to verify:\nhttps://store.steampowered.com/account/newaccountverification?stoken=deadbeef1234567890abcdef&creationid=1234567890123456789\nThanks";
+        assert_eq!(
+            extract_verification_link(body),
+            Some("https://store.steampowered.com/account/newaccountverification?stoken=deadbeef1234567890abcdef&creationid=1234567890123456789".to_string())
+        );
+    }
+
+    #[test]
+    fn no_verification_link() {
+        let body = "Hello, this is a regular email with no Steam links.";
+        assert_eq!(extract_verification_link(body), None);
     }
 
     #[tokio::test]

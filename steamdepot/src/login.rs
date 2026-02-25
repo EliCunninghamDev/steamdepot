@@ -191,6 +191,53 @@ pub async fn begin_auth_session(
     })
 }
 
+/// Begin a passwordless auth session (for newly created accounts with no password).
+///
+/// Calls `BeginAuthSessionViaCredentials` with only the account name/email,
+/// omitting password fields. Steam will respond with `allowed_confirmations`
+/// indicating that an email verification is required.
+pub async fn begin_auth_session_passwordless(
+    conn: &mut CmConnection,
+    account_name: &str,
+) -> Result<AuthSession> {
+    let req = CAuthenticationBeginAuthSessionViaCredentialsRequest {
+        account_name: Some(account_name.to_string()),
+        remember_login: Some(true),
+        platform_type: Some(1), // SteamClient
+        persistence: Some(1),   // Persistent
+        website_id: Some("Client".to_string()),
+        device_details: Some(CAuthenticationDeviceDetails {
+            device_friendly_name: Some("steamdepot-rs".to_string()),
+            platform_type: Some(1),
+            os_type: Some(20), // Linux
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let resp_bytes = conn
+        .service_method_call(
+            "Authentication.BeginAuthSessionViaCredentials#1",
+            &req.encode_to_vec(),
+        )
+        .await?;
+    let resp =
+        CAuthenticationBeginAuthSessionViaCredentialsResponse::decode(resp_bytes.as_slice())?;
+
+    let allowed: Vec<i32> = resp
+        .allowed_confirmations
+        .iter()
+        .filter_map(|c| c.confirmation_type)
+        .collect();
+
+    Ok(AuthSession {
+        client_id: resp.client_id.unwrap_or(0),
+        request_id: resp.request_id.unwrap_or_default(),
+        steam_id: resp.steamid.unwrap_or(0),
+        allowed_confirmations: allowed,
+        interval: resp.interval.unwrap_or(5.0),
+    })
+}
+
 /// Submit a Steam Guard code (email or TOTP).
 pub async fn submit_guard_code(
     conn: &mut CmConnection,

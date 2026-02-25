@@ -41,6 +41,27 @@ pub async fn begin(username: &str, password: &str) -> Result<(CmConnection, Auth
     Ok((conn, session))
 }
 
+/// Begin a passwordless auth session for a newly created account.
+///
+/// Resolves a CM server, connects, and starts an auth session with just the
+/// account name/email (no password). Steam will send a verification email.
+pub async fn begin_passwordless(username: &str) -> Result<(CmConnection, AuthSession)> {
+    let client = reqwest::Client::new();
+    let cm_list = cm_list::get_cm_list(&client).await?;
+
+    let ws_server = cm_list
+        .serverlist
+        .iter()
+        .find(|s| s.server_type == CmServerType::Websockets)
+        .ok_or_else(|| Error::Other("no websocket CM server found".into()))?;
+
+    let mut conn = CmConnection::connect(&ws_server.endpoint).await?;
+
+    let session = login::begin_auth_session_passwordless(&mut conn, username).await?;
+
+    Ok((conn, session))
+}
+
 /// Submit a Steam Guard code for the given auth session.
 pub async fn submit_guard(
     conn: &mut CmConnection,
