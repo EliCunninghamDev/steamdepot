@@ -327,7 +327,12 @@ pub async fn login_with_token(
     conn.send(EMsg::ClientLogon, &header, &body.encode_to_vec())
         .await?;
 
-    await_logon_response(conn).await
+    let session = await_logon_response(conn).await?;
+    // Mark as authenticated so downstream code knows this isn't anonymous.
+    if let Some(s) = conn.session_mut() {
+        s.authenticated = true;
+    }
+    Ok(session)
 }
 
 /// Extract the SteamID from a Steam JWT refresh token's `sub` claim.
@@ -388,6 +393,7 @@ async fn await_logon_response(conn: &mut CmConnection) -> Result<SessionState> {
         session_id: msg.header.client_sessionid.unwrap_or(0),
         cell_id: resp.cell_id.unwrap_or(0),
         heartbeat_seconds: resp.heartbeat_seconds.unwrap_or(0),
+        authenticated: false, // caller upgrades to true for authenticated logins
         licensed_appids: Default::default(),
     };
 

@@ -211,13 +211,16 @@ pub async fn get_depot_decryption_key(
         let eresult = resp.eresult.unwrap_or(2);
         if eresult != 1 {
             let reason = match eresult {
-                5 => "account doesn't own this depot",
                 2 => "invalid depot/app combination",
-                _ => "unknown error",
+                5 => "access denied — account doesn't own this app/depot",
+                15 => "access denied — the account does not have a license for this app. \
+                       If this is a free game, claim the free license on the Steam account first",
+                9 => "file not found — depot does not exist",
+                _ => "unexpected error",
             };
             return Err(Error::eresult(
                 eresult,
-                format!("depot {} decryption key: {}", depot_id, reason),
+                format!("depot {} (app {}) decryption key: {}", depot_id, app_id, reason),
             ));
         }
 
