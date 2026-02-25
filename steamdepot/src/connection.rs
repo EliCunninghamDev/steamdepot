@@ -307,20 +307,59 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
 
     let raw_emsg = u32::from_le_bytes(data[0..4].try_into().unwrap());
     let emsg_val = raw_emsg & !PROTO_MASK;
+    let is_proto = raw_emsg & PROTO_MASK != 0;
 
-    let header_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-    if data.len() < 8 + header_len {
-        return Err(Error::MessageTruncated);
+    if is_proto {
+        // Protobuf-framed: [emsg:4][header_len:4][header:N][body:...]
+        let header_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        if data.len() < 8 + header_len {
+            return Err(Error::MessageTruncated);
+        }
+        let header = CMsgProtoBufHeader::decode(&data[8..8 + header_len])?;
+        let body = data[8 + header_len..].to_vec();
+        Ok(RawFrame {
+            emsg_val,
+            header,
+            body,
+        })
+    } else {
+        // Non-protobuf: ExtendedClientMsgHdr (36 bytes) or MsgHdr (20 bytes).
+        // Byte 4 = header_size field for ExtendedClientMsgHdr.
+        let hdr_size = data[4] as usize;
+        let skip = if hdr_size >= 20 && hdr_size as usize <= data.len() {
+            hdr_size
+        } else {
+            // Fallback: assume 20-byte MsgHdr (emsg + 2x jobid)
+            20
+        };
+        if data.len() < skip {
+            return Err(Error::MessageTruncated);
+        }
+        // Extract steamid + sessionid from ExtendedClientMsgHdr if present
+        let header = if hdr_size == 36 && data.len() >= 36 {
+            // Bytes 24-31: steamID, bytes 32-35: sessionID
+            let steamid = u64::from_le_bytes(data[24..32].try_into().unwrap());
+            let session_id = i32::from_le_bytes(data[32..36].try_into().unwrap());
+            // Bytes 7-14: targetJobID, bytes 15-22: sourceJobID
+            let target_job = u64::from_le_bytes(data[7..15].try_into().unwrap());
+            let source_job = u64::from_le_bytes(data[15..23].try_into().unwrap());
+            CMsgProtoBufHeader {
+                steamid: Some(steamid),
+                client_sessionid: Some(session_id),
+                jobid_target: if target_job != u64::MAX { Some(target_job) } else { None },
+                jobid_source: if source_job != u64::MAX { Some(source_job) } else { None },
+                ..Default::default()
+            }
+        } else {
+            CMsgProtoBufHeader::default()
+        };
+        let body = data[skip..].to_vec();
+        Ok(RawFrame {
+            emsg_val,
+            header,
+            body,
+        })
     }
-
-    let header = CMsgProtoBufHeader::decode(&data[8..8 + header_len])?;
-    let body = data[8 + header_len..].to_vec();
-
-    Ok(RawFrame {
-        emsg_val,
-        header,
-        body,
-    })
 }
 
 // ---------------------------------------------------------------------------
