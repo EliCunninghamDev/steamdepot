@@ -8,6 +8,8 @@ use crate::connection::CmConnection;
 use crate::crypto::aes_ecb_decrypt;
 use crate::error::{Error, Result};
 use crate::proto::{
+    CContentServerDirectoryGetCdnAuthTokenRequest as CdnAuthTokenRequest,
+    CContentServerDirectoryGetCdnAuthTokenResponse as CdnAuthTokenResponse,
     CContentServerDirectoryGetManifestRequestCodeRequest as ManifestCodeRequest,
     CContentServerDirectoryGetManifestRequestCodeResponse as ManifestCodeResponse,
     CContentServerDirectoryGetServersForSteamPipeRequest as SteamPipeRequest,
@@ -30,6 +32,13 @@ pub struct CdnServer {
     pub cell_id: i32,
 }
 
+/// A cached CDN auth token.
+#[derive(Debug, Clone)]
+pub struct CdnAuthToken {
+    pub token: String,
+    pub expiration: u32,
+}
+
 /// A pool of CDN servers with penalty-based selection.
 ///
 /// Servers are sorted by penalty score (lowest first). On transient failures,
@@ -38,6 +47,8 @@ pub struct CdnServer {
 pub struct CdnPool {
     servers: Vec<CdnServer>,
     penalties: HashMap<String, u32>,
+    /// CDN auth tokens keyed by `"depot_id:host"`.
+    cdn_auth_tokens: HashMap<String, CdnAuthToken>,
 }
 
 impl CdnPool {
@@ -46,6 +57,7 @@ impl CdnPool {
         Self {
             servers,
             penalties: HashMap::new(),
+            cdn_auth_tokens: HashMap::new(),
         }
     }
 
@@ -62,6 +74,24 @@ impl CdnPool {
     /// Increment penalty for a host (called on transient HTTP failures).
     pub fn penalize(&mut self, host: &str) {
         *self.penalties.entry(host.to_string()).or_insert(0) += 1;
+    }
+
+    /// Get a cached CDN auth token for this depot+host, if still valid.
+    pub fn get_cdn_auth_token(&self, depot_id: u32, host: &str) -> Option<&CdnAuthToken> {
+        let key = format!("{}:{}", depot_id, host);
+        self.cdn_auth_tokens.get(&key).filter(|t| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            t.expiration > now
+        })
+    }
+
+    /// Store a CDN auth token.
+    pub fn set_cdn_auth_token(&mut self, depot_id: u32, host: &str, token: CdnAuthToken) {
+        let key = format!("{}:{}", depot_id, host);
+        self.cdn_auth_tokens.insert(key, token);
     }
 }
 
@@ -145,6 +175,35 @@ pub async fn get_cdn_servers(
         .collect())
 }
 
+/// Request a CDN auth token for a depot+host via the CM.
+///
+/// Called lazily when a CDN returns HTTP 403 (authorization required).
+pub async fn request_cdn_auth_token(
+    conn: &mut CmConnection,
+    depot_id: u32,
+    host: &str,
+    app_id: u32,
+) -> Result<CdnAuthToken> {
+    let body = CdnAuthTokenRequest {
+        depot_id: Some(depot_id),
+        host_name: Some(host.to_string()),
+        app_id: Some(app_id),
+    };
+
+    let resp_bytes = conn
+        .service_method_call(
+            "ContentServerDirectory.GetCDNAuthToken#1",
+            &body.encode_to_vec(),
+        )
+        .await?;
+
+    let resp = CdnAuthTokenResponse::decode(resp_bytes.as_slice())?;
+    Ok(CdnAuthToken {
+        token: resp.token.unwrap_or_default(),
+        expiration: resp.expiration_time.unwrap_or(0),
+    })
+}
+
 /// Download and parse a depot manifest from CDN.
 ///
 /// 1. HTTP GET `https://<host>/depot/<depot_id>/manifest/<manifest_id>/5/<code>`
@@ -158,11 +217,15 @@ pub async fn download_manifest(
     manifest_id: u64,
     request_code: u64,
     depot_key: &[u8],
+    cdn_auth_token: Option<&str>,
 ) -> Result<DepotManifest> {
-    let url = format!(
+    let mut url = format!(
         "https://{}/depot/{}/manifest/{}/5/{}",
-        cdn.host, depot_id, manifest_id, request_code
+        cdn.vhost, depot_id, manifest_id, request_code
     );
+    if let Some(token) = cdn_auth_token {
+        url.push_str(token);
+    }
 
     let resp = client.get(&url).send().await?.error_for_status().map_err(|e| {
         Error::Other(format!("CDN manifest download failed: {}", e))

@@ -258,11 +258,21 @@ async fn download_chunk_with_retry(
     depot_key: &[u8],
 ) -> Result<u64> {
     for attempt in 0..=MAX_RETRIES {
-        let server = pool.lock().unwrap().pick_server().clone();
-        let url = format!(
+        let (server, cdn_token) = {
+            let pool = pool.lock().unwrap();
+            let server = pool.pick_server().clone();
+            let token = pool
+                .get_cdn_auth_token(depot_id, &server.host)
+                .map(|t| t.token.clone());
+            (server, token)
+        };
+        let mut url = format!(
             "https://{}/depot/{}/chunk/{}",
-            server.host, depot_id, job.sha_hex
+            server.vhost, depot_id, job.sha_hex
         );
+        if let Some(ref token) = cdn_token {
+            url.push_str(token);
+        }
 
         match fetch_and_process(client, &url, depot_key, job).await {
             Ok(bytes) => return Ok(bytes),
@@ -325,7 +335,7 @@ fn is_retryable(e: &Error) -> bool {
     match e {
         Error::Http(re) => {
             if let Some(status) = re.status() {
-                matches!(status.as_u16(), 404 | 500 | 502 | 503 | 429)
+                matches!(status.as_u16(), 403 | 404 | 500 | 502 | 503 | 429)
             } else {
                 // Connection/timeout errors
                 re.is_connect() || re.is_timeout()
@@ -333,8 +343,8 @@ fn is_retryable(e: &Error) -> bool {
         }
         Error::Other(msg) => {
             // Retryable HTTP status errors surfaced via error_for_status
-            msg.contains("500") || msg.contains("502") || msg.contains("503")
-                || msg.contains("404") || msg.contains("429")
+            msg.contains("403") || msg.contains("500") || msg.contains("502")
+                || msg.contains("503") || msg.contains("404") || msg.contains("429")
         }
         _ => false,
     }

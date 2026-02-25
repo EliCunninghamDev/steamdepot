@@ -30,6 +30,7 @@ pub enum EMsg {
     ClientSessionToken = 850,
 
     ServiceMethodSendToClient = 147,
+    ServiceMethodCallFromClient = 151,
 
     ServiceMethodCallFromClientNonAuthed = 9804,
     ServiceMethodResponse = 9805,
@@ -66,6 +67,7 @@ impl EMsg {
             850 => Some(Self::ClientSessionToken),
 
             147 => Some(Self::ServiceMethodSendToClient),
+            151 => Some(Self::ServiceMethodCallFromClient),
 
             9804 => Some(Self::ServiceMethodCallFromClientNonAuthed),
             9805 => Some(Self::ServiceMethodResponse),

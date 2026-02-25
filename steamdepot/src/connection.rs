@@ -171,7 +171,7 @@ impl CmConnection {
         self.session.as_mut()
     }
 
-    /// Call a Steam service method (non-authed) and wait for the response.
+    /// Call a Steam service method (authed, post-login) and wait for the response.
     ///
     /// `method` is the fully qualified method name, e.g.
     /// `"ContentServerDirectory.GetManifestRequestCode#1"`.
@@ -189,7 +189,7 @@ impl CmConnection {
         header.jobid_source = Some(job_id);
 
         self.send(
-            EMsg::ServiceMethodCallFromClientNonAuthed,
+            EMsg::ServiceMethodCallFromClient,
             &header,
             body,
         )

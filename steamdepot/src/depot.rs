@@ -1,4 +1,4 @@
-use crate::cdn::{self, CdnServer, DepotManifest};
+use crate::cdn::{self, CdnAuthToken, CdnServer, DepotManifest};
 use crate::connection::CmConnection;
 use crate::error::{Error, Result};
 use crate::keyvalues::{self, KvValue};
@@ -45,6 +45,8 @@ pub struct DownloadPlan {
     pub cdn_servers: Vec<CdnServer>,
     pub granted_appids: Vec<u32>,
     pub granted_packageids: Vec<u32>,
+    /// CDN auth tokens obtained during manifest fetch, keyed by `"depot_id:host"`.
+    pub cdn_auth_tokens: Vec<(u32, String, CdnAuthToken)>,
 }
 
 /// Prepare a download plan: fetch app info, resolve depots, obtain keys.
@@ -127,6 +129,7 @@ pub async fn prepare_download(
         cdn_servers: Vec::new(),
         granted_appids: Vec::new(),
         granted_packageids: Vec::new(),
+        cdn_auth_tokens: Vec::new(),
     })
 }
 
@@ -168,15 +171,46 @@ pub async fn fetch_manifests(
         .await?;
         dp.manifest_request_code = Some(code);
 
-        let manifest = cdn::download_manifest(
+        let manifest = match cdn::download_manifest(
             client,
             &cdn_server,
             dp.depot.depot_id,
             dp.depot.manifest_id,
             code,
             &dp.key,
+            None,
         )
-        .await?;
+        .await
+        {
+            Ok(m) => m,
+            Err(Error::Other(msg)) if msg.contains("403") => {
+                // CDN returned 403 — request an auth token and retry
+                let token = cdn::request_cdn_auth_token(
+                    conn,
+                    dp.depot.depot_id,
+                    &cdn_server.host,
+                    plan.app_id,
+                )
+                .await?;
+                let result = cdn::download_manifest(
+                    client,
+                    &cdn_server,
+                    dp.depot.depot_id,
+                    dp.depot.manifest_id,
+                    code,
+                    &dp.key,
+                    Some(&token.token),
+                )
+                .await?;
+                plan.cdn_auth_tokens.push((
+                    dp.depot.depot_id,
+                    cdn_server.host.clone(),
+                    token,
+                ));
+                result
+            }
+            Err(e) => return Err(e),
+        };
         dp.manifest = Some(manifest);
     }
 

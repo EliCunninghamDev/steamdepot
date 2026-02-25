@@ -550,7 +550,11 @@ async fn main() -> Result<()> {
                             download::prepare_directory_tree(install_dir, manifest).await?;
                         log.prepared(app_id, dp.depot.depot_id, &result);
 
-                        let pool = Arc::new(Mutex::new(CdnPool::new(plan.cdn_servers.clone())));
+                        let mut cdn_pool = CdnPool::new(plan.cdn_servers.clone());
+                        for (depot_id, host, token) in &plan.cdn_auth_tokens {
+                            cdn_pool.set_cdn_auth_token(*depot_id, host, token.clone());
+                        }
+                        let pool = Arc::new(Mutex::new(cdn_pool));
                         log.download_start(plan.cdn_servers.len());
 
                         let bytes_total =
