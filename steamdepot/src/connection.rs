@@ -61,7 +61,11 @@ impl CmConnection {
     /// Connect to a CM server's WebSocket endpoint.
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let url = format!("wss://{}/cmsocket/", endpoint);
-        let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.max_frame_size = None;    // unlimited
+        config.max_message_size = None;  // unlimited
+        let (ws, _) =
+            tokio_tungstenite::connect_async_with_config(&url, Some(config), false).await?;
         let (sink, stream) = ws.split();
         Ok(Self {
             sink: Arc::new(Mutex::new(sink)),
