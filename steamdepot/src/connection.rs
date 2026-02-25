@@ -35,6 +35,7 @@ pub struct CmMessage {
 /// Raw parsed frame, before EMsg lookup.
 struct RawFrame {
     emsg_val: u32,
+    is_proto: bool,
     header: CMsgProtoBufHeader,
     body: Vec<u8>,
 }
@@ -319,6 +320,7 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
         let body = data[8 + header_len..].to_vec();
         Ok(RawFrame {
             emsg_val,
+            is_proto: true,
             header,
             body,
         })
@@ -356,6 +358,7 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
         let body = data[skip..].to_vec();
         Ok(RawFrame {
             emsg_val,
+            is_proto: false,
             header,
             body,
         })
@@ -385,6 +388,11 @@ impl CmStream {
                 Some(data) => parse_raw_frame(&data)?,
                 None => parse_raw_frame(&self.recv_raw().await?)?,
             };
+
+            if !raw.is_proto {
+                // Don't skip — some Steam responses only come as non-proto
+                // (e.g. ClientPICSProductInfoResponse for authenticated sessions)
+            }
 
             if raw.emsg_val == EMsg::Multi as u32 {
                 self.unpack_multi(&raw.body)?;
