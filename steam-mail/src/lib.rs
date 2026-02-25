@@ -97,10 +97,12 @@ async fn handle_smtp(
         if in_data {
             if line == "." {
                 in_data = false;
+                // Decode quoted-printable if the email uses it
+                let decoded = decode_quoted_printable(&body);
                 // Try guard code first, then verification link
-                if let Some(code) = extract_guard_code(&body) {
+                if let Some(code) = extract_guard_code(&decoded) {
                     let _ = item_tx.send(SteamMailItem::GuardCode(code)).await;
-                } else if let Some(url) = extract_verification_link(&body) {
+                } else if let Some(url) = extract_verification_link(&decoded) {
                     let _ = item_tx.send(SteamMailItem::VerificationLink(url)).await;
                 }
                 body.clear();
@@ -136,6 +138,49 @@ async fn handle_smtp(
     }
 
     Ok(())
+}
+
+/// Decode quoted-printable encoded text.
+///
+/// In SMTP emails, `=` is encoded as `=3D`, soft line breaks as `=\n`, etc.
+fn decode_quoted_printable(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && i + 2 < bytes.len() {
+            // Soft line break: = followed by \r\n or \n
+            if bytes[i + 1] == b'\r' && i + 2 < bytes.len() && bytes[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            if bytes[i + 1] == b'\n' {
+                i += 2;
+                continue;
+            }
+            // Hex-encoded byte
+            if let (Some(hi), Some(lo)) = (
+                hex_val(bytes[i + 1]),
+                hex_val(bytes[i + 2]),
+            ) {
+                out.push((hi << 4 | lo) as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Extract a Steam verification/confirmation link from an email body.
@@ -253,6 +298,25 @@ mod tests {
             extract_verification_link(body),
             Some("https://store.steampowered.com/account/newaccountverification?stoken=deadbeef1234567890abcdef&creationid=1234567890123456789".to_string())
         );
+    }
+
+    #[test]
+    fn extract_verification_link_quoted_printable() {
+        // Real SMTP emails encode = as =3D in quoted-printable.
+        // decode_quoted_printable is called in handle_smtp before extraction.
+        let raw = "Click here:\nhttps://store.steampowered.com/account/newaccountverification?stoken=3Deb4d1234&creationid=3D5678\nThanks";
+        let decoded = decode_quoted_printable(raw);
+        assert_eq!(
+            extract_verification_link(&decoded),
+            Some("https://store.steampowered.com/account/newaccountverification?stoken=eb4d1234&creationid=5678".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_qp_basic() {
+        assert_eq!(decode_quoted_printable("foo=3Dbar"), "foo=bar");
+        assert_eq!(decode_quoted_printable("line1=\nline2"), "line1line2");
+        assert_eq!(decode_quoted_printable("no encoding"), "no encoding");
     }
 
     #[test]
