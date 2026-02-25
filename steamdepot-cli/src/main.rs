@@ -63,6 +63,10 @@ struct Cli {
     /// Directory to install depot content into (requires --fetch-manifests)
     #[arg(long)]
     install_dir: Option<PathBuf>,
+
+    /// Login ID for the anonymous session (default: random)
+    #[arg(long)]
+    login_id: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +435,8 @@ async fn main() -> Result<()> {
     log.connecting(&ws_server.endpoint);
 
     let mut conn = CmConnection::connect(&ws_server.endpoint).await?;
-    let session = login::login_anonymous(&mut conn).await?;
+    let login_id = cli.login_id.unwrap_or_else(login::rand_login_id);
+    let session = login::login_anonymous_with_id(&mut conn, login_id).await?;
 
     log.login(
         session.steam_id,
