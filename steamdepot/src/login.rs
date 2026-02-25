@@ -15,8 +15,10 @@ use crate::proto::{
 };
 use crate::session::SessionState;
 
-/// Anonymous SteamID: universe=Public(1), type=AnonUser(4), instance=0, account_id=0.
-const ANONYMOUS_STEAM_ID: u64 = (1u64 << 56) | (4u64 << 52);
+/// Anonymous SteamID: universe=Public(1), type=AnonUser(10), instance=0, account_id=0.
+/// EAccountType 10 = AnonUser (for content downloads).
+/// EAccountType 4 = AnonGameServer (for game servers registering with Steam, NOT downloads).
+const ANONYMOUS_STEAM_ID: u64 = (1u64 << 56) | (10u64 << 52);
 
 /// XOR mask applied to the login ID before sending as `obfuscated_private_ip`.
 const LOGIN_ID_XOR: u32 = 0xBAADF00D;

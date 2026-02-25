@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::proto::{
     c_msg_client_pics_product_info_request as req_types,
     CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
+    CMsgClientPicsAccessTokenRequest, CMsgClientPicsAccessTokenResponse,
     CMsgClientPicsProductInfoRequest as PicsRequest,
     CMsgClientPicsProductInfoResponse as PicsResponse,
     CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse,
@@ -36,31 +37,94 @@ pub struct ProductInfoResponse {
     pub unknown_packageids: Vec<u32>,
 }
 
+/// Fetch PICS access tokens for the given app and/or package IDs.
+///
+/// Access tokens are required by `get_product_info` — without them, Steam may
+/// silently drop the PICS response (especially for anonymous sessions).
+async fn get_access_tokens(
+    conn: &mut CmConnection,
+    app_ids: &[u32],
+    package_ids: &[u32],
+) -> Result<(Vec<(u32, u64)>, Vec<(u32, u64)>)> {
+    let header = conn.session_header()?;
+
+    let body = CMsgClientPicsAccessTokenRequest {
+        appids: app_ids.to_vec(),
+        packageids: package_ids.to_vec(),
+    };
+
+    conn.send(
+        EMsg::ClientPICSAccessTokenRequest,
+        &header,
+        &body.encode_to_vec(),
+    )
+    .await?;
+
+    loop {
+        let msg = conn.recv().await?;
+        if msg.emsg != EMsg::ClientPICSAccessTokenResponse {
+            continue;
+        }
+
+        let resp = CMsgClientPicsAccessTokenResponse::decode(msg.body.as_slice())?;
+
+        let app_tokens: Vec<(u32, u64)> = resp
+            .app_access_tokens
+            .iter()
+            .filter_map(|t| Some((t.appid?, t.access_token?)))
+            .collect();
+
+        let pkg_tokens: Vec<(u32, u64)> = resp
+            .package_access_tokens
+            .iter()
+            .filter_map(|t| Some((t.packageid?, t.access_token?)))
+            .collect();
+
+        return Ok((app_tokens, pkg_tokens));
+    }
+}
+
 /// Fetch product info for the given app and/or package IDs.
 ///
-/// Handles multi-part responses (`response_pending`) automatically, collecting
-/// all chunks before returning.
+/// Automatically fetches PICS access tokens first (matching DepotDownloader
+/// and SteamKit2 behavior). Handles multi-part responses (`response_pending`)
+/// automatically, collecting all chunks before returning.
 pub async fn get_product_info(
     conn: &mut CmConnection,
     app_ids: &[u32],
     package_ids: &[u32],
 ) -> Result<ProductInfoResponse> {
+    // Step 1: Fetch access tokens (required for anonymous sessions)
+    let (app_tokens, pkg_tokens) = get_access_tokens(conn, app_ids, package_ids).await?;
+
     let header = conn.session_header()?;
 
     let body = PicsRequest {
         apps: app_ids
             .iter()
-            .map(|&id| req_types::AppInfo {
-                appid: Some(id),
-                access_token: None,
-                only_public_obsolete: None,
+            .map(|&id| {
+                let token = app_tokens
+                    .iter()
+                    .find(|(aid, _)| *aid == id)
+                    .map(|(_, t)| *t);
+                req_types::AppInfo {
+                    appid: Some(id),
+                    access_token: token,
+                    only_public_obsolete: None,
+                }
             })
             .collect(),
         packages: package_ids
             .iter()
-            .map(|&id| req_types::PackageInfo {
-                packageid: Some(id),
-                access_token: None,
+            .map(|&id| {
+                let token = pkg_tokens
+                    .iter()
+                    .find(|(pid, _)| *pid == id)
+                    .map(|(_, t)| *t);
+                req_types::PackageInfo {
+                    packageid: Some(id),
+                    access_token: token,
+                }
             })
             .collect(),
         meta_data_only: Some(false),
