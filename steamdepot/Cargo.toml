@@ -1,6 +1,6 @@
 [package]
 name = "steamdepot"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Steam depot downloader library — CM connection, authentication, PICS, CDN, and chunk downloading"
 license = "LGPL-2.1-only"
