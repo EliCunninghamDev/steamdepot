@@ -7,6 +7,9 @@ use prost::Message;
 use crate::connection::CmConnection;
 use crate::crypto::aes_ecb_decrypt;
 use crate::error::{Error, Result};
+
+const CM_RETRIES: u32 = 3;
+const CM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 use crate::proto::{
     CContentServerDirectoryGetCdnAuthTokenRequest as CdnAuthTokenRequest,
     CContentServerDirectoryGetCdnAuthTokenResponse as CdnAuthTokenResponse,
@@ -121,25 +124,44 @@ pub async fn get_manifest_request_code(
         app_branch: Some(branch.to_string()),
         branch_password_hash: None,
     };
+    let encoded = body.encode_to_vec();
 
-    let resp_bytes = conn
-        .service_method_call(
-            "ContentServerDirectory.GetManifestRequestCode#1",
-            &body.encode_to_vec(),
-        )
-        .await?;
+    let mut last_err = None;
+    for attempt in 0..=CM_RETRIES {
+        if attempt > 0 {
+            eprintln!(
+                "retrying GetManifestRequestCode for depot {} (attempt {}/{})",
+                depot_id, attempt + 1, CM_RETRIES + 1
+            );
+            tokio::time::sleep(CM_RETRY_DELAY * attempt).await;
+        }
 
-    let resp = ManifestCodeResponse::decode(resp_bytes.as_slice())?;
-    let code = resp.manifest_request_code.unwrap_or(0);
-
-    if code == 0 {
-        return Err(Error::Other(format!(
-            "manifest request code denied for depot {} manifest {}",
-            depot_id, manifest_id
-        )));
+        match conn
+            .service_method_call(
+                "ContentServerDirectory.GetManifestRequestCode#1",
+                &encoded,
+            )
+            .await
+        {
+            Ok(resp_bytes) => {
+                let resp = ManifestCodeResponse::decode(resp_bytes.as_slice())?;
+                let code = resp.manifest_request_code.unwrap_or(0);
+                if code == 0 {
+                    return Err(Error::Other(format!(
+                        "manifest request code denied for depot {} manifest {}",
+                        depot_id, manifest_id
+                    )));
+                }
+                return Ok(code);
+            }
+            Err(e) if is_cm_retryable(&e) && attempt < CM_RETRIES => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
     }
 
-    Ok(code)
+    Err(last_err.unwrap())
 }
 
 /// Fetch CDN server list for content downloads.
@@ -152,27 +174,47 @@ pub async fn get_cdn_servers(
         max_servers: Some(20),
         ..Default::default()
     };
+    let encoded = body.encode_to_vec();
 
-    let resp_bytes = conn
-        .service_method_call(
-            "ContentServerDirectory.GetServersForSteamPipe#1",
-            &body.encode_to_vec(),
-        )
-        .await?;
+    let mut last_err = None;
+    for attempt in 0..=CM_RETRIES {
+        if attempt > 0 {
+            eprintln!(
+                "retrying GetServersForSteamPipe (attempt {}/{})",
+                attempt + 1, CM_RETRIES + 1
+            );
+            tokio::time::sleep(CM_RETRY_DELAY * attempt).await;
+        }
 
-    let resp = SteamPipeResponse::decode(resp_bytes.as_slice())?;
+        match conn
+            .service_method_call(
+                "ContentServerDirectory.GetServersForSteamPipe#1",
+                &encoded,
+            )
+            .await
+        {
+            Ok(resp_bytes) => {
+                let resp = SteamPipeResponse::decode(resp_bytes.as_slice())?;
+                return Ok(resp
+                    .servers
+                    .into_iter()
+                    .map(|s: CContentServerDirectoryServerInfo| CdnServer {
+                        host: s.host.unwrap_or_default(),
+                        vhost: s.vhost.unwrap_or_default(),
+                        server_type: s.r#type.unwrap_or_default(),
+                        load: s.load.unwrap_or(0),
+                        cell_id: s.cell_id.unwrap_or(0),
+                    })
+                    .collect());
+            }
+            Err(e) if is_cm_retryable(&e) && attempt < CM_RETRIES => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
-    Ok(resp
-        .servers
-        .into_iter()
-        .map(|s: CContentServerDirectoryServerInfo| CdnServer {
-            host: s.host.unwrap_or_default(),
-            vhost: s.vhost.unwrap_or_default(),
-            server_type: s.r#type.unwrap_or_default(),
-            load: s.load.unwrap_or(0),
-            cell_id: s.cell_id.unwrap_or(0),
-        })
-        .collect())
+    Err(last_err.unwrap())
 }
 
 /// Request a CDN auth token for a depot+host via the CM.
@@ -189,19 +231,48 @@ pub async fn request_cdn_auth_token(
         host_name: Some(host.to_string()),
         app_id: Some(app_id),
     };
+    let encoded = body.encode_to_vec();
 
-    let resp_bytes = conn
-        .service_method_call(
-            "ContentServerDirectory.GetCDNAuthToken#1",
-            &body.encode_to_vec(),
-        )
-        .await?;
+    let mut last_err = None;
+    for attempt in 0..=CM_RETRIES {
+        if attempt > 0 {
+            eprintln!(
+                "retrying GetCDNAuthToken for depot {} (attempt {}/{})",
+                depot_id, attempt + 1, CM_RETRIES + 1
+            );
+            tokio::time::sleep(CM_RETRY_DELAY * attempt).await;
+        }
 
-    let resp = CdnAuthTokenResponse::decode(resp_bytes.as_slice())?;
-    Ok(CdnAuthToken {
-        token: resp.token.unwrap_or_default(),
-        expiration: resp.expiration_time.unwrap_or(0),
-    })
+        match conn
+            .service_method_call(
+                "ContentServerDirectory.GetCDNAuthToken#1",
+                &encoded,
+            )
+            .await
+        {
+            Ok(resp_bytes) => {
+                let resp = CdnAuthTokenResponse::decode(resp_bytes.as_slice())?;
+                return Ok(CdnAuthToken {
+                    token: resp.token.unwrap_or_default(),
+                    expiration: resp.expiration_time.unwrap_or(0),
+                });
+            }
+            Err(e) if is_cm_retryable(&e) && attempt < CM_RETRIES => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap())
+}
+
+/// Check if a CM service method error is worth retrying.
+fn is_cm_retryable(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::ServiceMethodTimeout(_) | Error::ConnectionClosed | Error::WebSocket(_)
+    )
 }
 
 /// Download and parse a depot manifest from CDN.

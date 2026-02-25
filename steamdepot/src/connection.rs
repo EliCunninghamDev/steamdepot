@@ -19,6 +19,9 @@ use crate::session::SessionState;
 
 static NEXT_JOB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Timeout for waiting on a service method response from the CM.
+const SERVICE_METHOD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 type WsStreamInner = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStreamInner, tungstenite::Message>;
 type WsStream = SplitStream<WsStreamInner>;
@@ -195,24 +198,30 @@ impl CmConnection {
         )
         .await?;
 
-        loop {
-            let msg = self.recv().await?;
-            if msg.emsg != EMsg::ServiceMethodResponse
-                && msg.emsg != EMsg::ServiceMethodSendToClient
-            {
-                continue;
-            }
-            if msg.header.jobid_target == Some(job_id) {
-                let eresult = msg.header.eresult.unwrap_or(2);
-                if eresult != 1 {
-                    return Err(Error::eresult(
-                        eresult,
-                        format!("service method {}", method),
-                    ));
+        let wait_for_response = async {
+            loop {
+                let msg = self.recv().await?;
+                if msg.emsg != EMsg::ServiceMethodResponse
+                    && msg.emsg != EMsg::ServiceMethodSendToClient
+                {
+                    continue;
                 }
-                return Ok(msg.body);
+                if msg.header.jobid_target == Some(job_id) {
+                    let eresult = msg.header.eresult.unwrap_or(2);
+                    if eresult != 1 {
+                        return Err(Error::eresult(
+                            eresult,
+                            format!("service method {}", method),
+                        ));
+                    }
+                    return Ok(msg.body);
+                }
             }
-        }
+        };
+
+        tokio::time::timeout(SERVICE_METHOD_TIMEOUT, wait_for_response)
+            .await
+            .map_err(|_| Error::ServiceMethodTimeout(method.to_string()))?
     }
 
     /// Call a Steam service method without requiring a session.
@@ -239,24 +248,30 @@ impl CmConnection {
         )
         .await?;
 
-        loop {
-            let msg = self.recv().await?;
-            if msg.emsg != EMsg::ServiceMethodResponse
-                && msg.emsg != EMsg::ServiceMethodSendToClient
-            {
-                continue;
-            }
-            if msg.header.jobid_target == Some(job_id) {
-                let eresult = msg.header.eresult.unwrap_or(2);
-                if eresult != 1 {
-                    return Err(Error::eresult(
-                        eresult,
-                        format!("service method {}", method),
-                    ));
+        let wait_for_response = async {
+            loop {
+                let msg = self.recv().await?;
+                if msg.emsg != EMsg::ServiceMethodResponse
+                    && msg.emsg != EMsg::ServiceMethodSendToClient
+                {
+                    continue;
                 }
-                return Ok(msg.body);
+                if msg.header.jobid_target == Some(job_id) {
+                    let eresult = msg.header.eresult.unwrap_or(2);
+                    if eresult != 1 {
+                        return Err(Error::eresult(
+                            eresult,
+                            format!("service method {}", method),
+                        ));
+                    }
+                    return Ok(msg.body);
+                }
             }
-        }
+        };
+
+        tokio::time::timeout(SERVICE_METHOD_TIMEOUT, wait_for_response)
+            .await
+            .map_err(|_| Error::ServiceMethodTimeout(method.to_string()))?
     }
 
     /// Build a `CMsgProtoBufHeader` populated with the current session's

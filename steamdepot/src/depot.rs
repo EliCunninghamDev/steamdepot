@@ -137,6 +137,8 @@ pub async fn prepare_download(
 ///
 /// Call this after [`prepare_download`] to populate `manifest_request_code`,
 /// `manifest`, and `cdn_servers` on the plan.
+const MANIFEST_RETRIES: u32 = 3;
+
 pub async fn fetch_manifests(
     conn: &mut CmConnection,
     client: &reqwest::Client,
@@ -150,13 +152,16 @@ pub async fn fetch_manifests(
 
     plan.cdn_servers = cdn::get_cdn_servers(conn, cell_id).await?;
 
-    let cdn_server = plan
-        .cdn_servers
-        .iter()
-        .find(|s| s.server_type == "SteamCache" || s.server_type == "CDN")
-        .or_else(|| plan.cdn_servers.first())
-        .ok_or_else(|| Error::Other("no CDN servers available".into()))?
-        .clone();
+    if plan.cdn_servers.is_empty() {
+        return Err(Error::Other("no CDN servers available".into()));
+    }
+
+    // Prefer SteamCache/CDN servers, but keep all for fallback rotation
+    let preferred: Vec<_> = plan.cdn_servers.iter()
+        .filter(|s| s.server_type == "SteamCache" || s.server_type == "CDN")
+        .cloned()
+        .collect();
+    let servers = if preferred.is_empty() { &plan.cdn_servers } else { &preferred };
 
     for dp in &mut plan.plans {
         let key_app = dp.depot.containing_app(plan.app_id);
@@ -171,47 +176,79 @@ pub async fn fetch_manifests(
         .await?;
         dp.manifest_request_code = Some(code);
 
-        let manifest = match cdn::download_manifest(
-            client,
-            &cdn_server,
-            dp.depot.depot_id,
-            dp.depot.manifest_id,
-            code,
-            &dp.key,
-            None,
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(Error::Other(msg)) if msg.contains("403") => {
-                // CDN returned 403 — request an auth token and retry
-                let token = cdn::request_cdn_auth_token(
-                    conn,
-                    dp.depot.depot_id,
-                    &cdn_server.host,
-                    plan.app_id,
-                )
-                .await?;
-                let result = cdn::download_manifest(
-                    client,
-                    &cdn_server,
-                    dp.depot.depot_id,
-                    dp.depot.manifest_id,
-                    code,
-                    &dp.key,
-                    Some(&token.token),
-                )
-                .await?;
-                plan.cdn_auth_tokens.push((
-                    dp.depot.depot_id,
-                    cdn_server.host.clone(),
-                    token,
-                ));
-                result
+        let mut last_err = None;
+        for attempt in 0..=MANIFEST_RETRIES {
+            let server = &servers[attempt as usize % servers.len()];
+
+            let result = cdn::download_manifest(
+                client,
+                server,
+                dp.depot.depot_id,
+                dp.depot.manifest_id,
+                code,
+                &dp.key,
+                None,
+            )
+            .await;
+
+            match result {
+                Ok(m) => {
+                    dp.manifest = Some(m);
+                    last_err = None;
+                    break;
+                }
+                Err(Error::Other(ref msg)) if msg.contains("403") => {
+                    // CDN returned 403 — request an auth token and retry with same server
+                    match cdn::request_cdn_auth_token(
+                        conn,
+                        dp.depot.depot_id,
+                        &server.host,
+                        plan.app_id,
+                    )
+                    .await
+                    {
+                        Ok(token) => {
+                            match cdn::download_manifest(
+                                client,
+                                server,
+                                dp.depot.depot_id,
+                                dp.depot.manifest_id,
+                                code,
+                                &dp.key,
+                                Some(&token.token),
+                            )
+                            .await
+                            {
+                                Ok(m) => {
+                                    plan.cdn_auth_tokens.push((
+                                        dp.depot.depot_id,
+                                        server.host.clone(),
+                                        token,
+                                    ));
+                                    dp.manifest = Some(m);
+                                    last_err = None;
+                                    break;
+                                }
+                                Err(e) => last_err = Some(e),
+                            }
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(e) => last_err = Some(e),
             }
-            Err(e) => return Err(e),
-        };
-        dp.manifest = Some(manifest);
+
+            if attempt < MANIFEST_RETRIES {
+                eprintln!(
+                    "retrying manifest download for depot {} with next CDN server (attempt {}/{})",
+                    dp.depot.depot_id, attempt + 2, MANIFEST_RETRIES + 1
+                );
+            }
+        }
+
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
 
     Ok(())

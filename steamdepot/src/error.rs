@@ -35,6 +35,9 @@ pub enum Error {
     #[error("no session set")]
     NoSession,
 
+    #[error("service method timed out: {0}")]
+    ServiceMethodTimeout(String),
+
     #[error("keyvalues parse error at byte {offset}: {msg}")]
     KvParse { offset: usize, msg: String },
 
