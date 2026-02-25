@@ -2,6 +2,9 @@
 name = "steamdepot"
 version = "0.1.0"
 edition = "2024"
+description = "Steam depot downloader library — CM connection, authentication, PICS, CDN, and chunk downloading"
+license = "LGPL-2.1-only"
+repository = "https://github.com/EliCunninghamDev/stemdepot"
 
 [dependencies]
 prost = "0.13"
@@ -20,6 +23,7 @@ cbc = "0.1"
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 ruzstd = "0.7"
+rsa = "0.9"
 
 [build-dependencies]
 prost-build = "0.13"

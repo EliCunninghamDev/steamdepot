@@ -8,6 +8,7 @@ use crate::proto::{
     CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
     CMsgClientPicsProductInfoRequest as PicsRequest,
     CMsgClientPicsProductInfoResponse as PicsResponse,
+    CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse,
 };
 
 /// Returned product info for a single app.
@@ -157,5 +158,58 @@ pub async fn get_depot_decryption_key(
         }
 
         return Ok(resp.depot_encryption_key.unwrap_or_default());
+    }
+}
+
+/// Result of a free license request.
+#[derive(Debug)]
+pub struct FreeLicenseResponse {
+    pub granted_appids: Vec<u32>,
+    pub granted_packageids: Vec<u32>,
+}
+
+/// Request a free license for the given app IDs.
+///
+/// Steam grants free-to-play / free-to-download licenses on demand. This is
+/// required for anonymous accounts to access dedicated server depots like
+/// TF2 Classic (3557020).
+pub async fn request_free_license(
+    conn: &mut CmConnection,
+    app_ids: &[u32],
+) -> Result<FreeLicenseResponse> {
+    let header = conn.session_header()?;
+
+    let body = CMsgClientRequestFreeLicense {
+        appids: app_ids.to_vec(),
+    };
+
+    conn.send(
+        EMsg::ClientRequestFreeLicense,
+        &header,
+        &body.encode_to_vec(),
+    )
+    .await?;
+
+    loop {
+        let msg = conn.recv().await?;
+
+        if msg.emsg != EMsg::ClientRequestFreeLicenseResponse {
+            continue;
+        }
+
+        let resp = CMsgClientRequestFreeLicenseResponse::decode(msg.body.as_slice())?;
+
+        let eresult = resp.eresult.unwrap_or(2);
+        if eresult != 1 {
+            return Err(Error::eresult(
+                eresult as i32,
+                format!("free license request for {:?}", app_ids),
+            ));
+        }
+
+        return Ok(FreeLicenseResponse {
+            granted_appids: resp.granted_appids,
+            granted_packageids: resp.granted_packageids,
+        });
     }
 }

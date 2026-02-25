@@ -1,0 +1,10 @@
+[package]
+name = "steam-mail"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal SMTP server for extracting Steam Guard codes from incoming emails"
+license = "LGPL-2.1-only"
+repository = "https://github.com/EliCunninghamDev/stemdepot"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros"] }

@@ -67,6 +67,14 @@ struct Cli {
     /// Login ID for the anonymous session (default: random)
     #[arg(long)]
     login_id: Option<u32>,
+
+    /// Steam account name (enables authenticated login)
+    #[arg(long)]
+    username: Option<String>,
+
+    /// Refresh token for authenticated login
+    #[arg(long)]
+    token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,17 +111,18 @@ impl Log {
         }
     }
 
-    fn login(&self, steam_id: u64, session_id: i32, cell_id: u32, heartbeat: i32) {
+    fn login(&self, mode: &str, steam_id: u64, session_id: i32, cell_id: u32, heartbeat: i32) {
         if self.json() {
             Self::jline(json!({
                 "type": "login",
+                "mode": mode,
                 "steam_id": steam_id,
                 "session_id": session_id,
                 "cell_id": cell_id,
                 "heartbeat_seconds": heartbeat
             }));
         } else {
-            println!("Logged in anonymously!");
+            println!("Logged in {}!", mode);
             println!("  steam_id:          {}", steam_id);
             println!("  session_id:        {}", session_id);
             println!("  cell_id:           {}", cell_id);
@@ -182,6 +191,21 @@ impl Log {
                 println!("  No depots found");
             }
             return;
+        }
+        if !plan.granted_appids.is_empty() || !plan.granted_packageids.is_empty() {
+            if self.json() {
+                Self::jline(json!({
+                    "type": "license_granted",
+                    "app_id": plan.app_id,
+                    "granted_appids": plan.granted_appids,
+                    "granted_packageids": plan.granted_packageids
+                }));
+            } else {
+                println!(
+                    "  Free license granted: apps={:?} packages={:?}",
+                    plan.granted_appids, plan.granted_packageids
+                );
+            }
         }
         if self.json() {
             let depots: Vec<_> = plan.plans.iter().map(|dp| {
@@ -435,10 +459,34 @@ async fn main() -> Result<()> {
     log.connecting(&ws_server.endpoint);
 
     let mut conn = CmConnection::connect(&ws_server.endpoint).await?;
-    let login_id = cli.login_id.unwrap_or_else(login::rand_login_id);
-    let session = login::login_anonymous_with_id(&mut conn, login_id).await?;
 
+    let session = match (&cli.username, &cli.token) {
+        (Some(username), Some(token)) => {
+            login::login_with_token(&mut conn, username, token).await?
+        }
+        (Some(_), None) => {
+            return Err(steamdepot::error::Error::Other(
+                "--username requires --token".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(steamdepot::error::Error::Other(
+                "--token requires --username".into(),
+            ));
+        }
+        (None, None) => {
+            let login_id = cli.login_id.unwrap_or_else(login::rand_login_id);
+            login::login_anonymous_with_id(&mut conn, login_id).await?
+        }
+    };
+
+    let auth_mode = if cli.username.is_some() {
+        "authenticated"
+    } else {
+        "anonymously"
+    };
     log.login(
+        auth_mode,
         session.steam_id,
         session.session_id,
         session.cell_id,

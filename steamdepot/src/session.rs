@@ -1,9 +1,13 @@
+use std::collections::HashSet;
+
 #[derive(Clone)]
 pub struct SessionState {
     pub steam_id: u64,
     pub session_id: i32,
     pub cell_id: u32,
     pub heartbeat_seconds: i32,
+    /// App IDs for which a free license has already been requested this session.
+    pub licensed_appids: HashSet<u32>,
 }
 
 impl SessionState {
@@ -13,6 +17,7 @@ impl SessionState {
             session_id: 0,
             cell_id: 0,
             heartbeat_seconds: 0,
+            licensed_appids: HashSet::new(),
         }
     }
 }

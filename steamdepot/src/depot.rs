@@ -43,6 +43,8 @@ pub struct DownloadPlan {
     pub app_id: u32,
     pub plans: Vec<DepotPlan>,
     pub cdn_servers: Vec<CdnServer>,
+    pub granted_appids: Vec<u32>,
+    pub granted_packageids: Vec<u32>,
 }
 
 /// Prepare a download plan: fetch app info, resolve depots, obtain keys.
@@ -58,6 +60,31 @@ pub async fn prepare_download(
         .ok_or_else(|| Error::Other(format!("app {} not found", config.app_id)))?;
 
     let depots = resolve_depots(&app_info, &config.os, &config.branch)?;
+
+    // Request a free license for the app (and any depotfromapp references).
+    // Skip app IDs we've already requested this session.
+    let mut license_apps = vec![config.app_id];
+    for d in &depots {
+        if let Some(from) = d.depot_from_app {
+            if !license_apps.contains(&from) {
+                license_apps.push(from);
+            }
+        }
+    }
+    let cached = conn.session().map(|s| &s.licensed_appids).cloned().unwrap_or_default();
+    let needed: Vec<u32> = license_apps.into_iter().filter(|id| !cached.contains(id)).collect();
+    let license = if needed.is_empty() {
+        None
+    } else {
+        let result = pics::request_free_license(conn, &needed).await.ok();
+        // Cache all requested app IDs so we don't re-request
+        if let Some(session) = conn.session_mut() {
+            for &id in &needed {
+                session.licensed_appids.insert(id);
+            }
+        }
+        result
+    };
 
     let mut plans = Vec::new();
     for depot in depots {
@@ -75,6 +102,8 @@ pub async fn prepare_download(
         app_id: config.app_id,
         plans,
         cdn_servers: Vec::new(),
+        granted_appids: license.as_ref().map(|l| l.granted_appids.clone()).unwrap_or_default(),
+        granted_packageids: license.as_ref().map(|l| l.granted_packageids.clone()).unwrap_or_default(),
     })
 }
 

@@ -161,6 +161,11 @@ impl CmConnection {
         self.session.as_ref()
     }
 
+    /// Mutable access to the stored session state, if set.
+    pub fn session_mut(&mut self) -> Option<&mut SessionState> {
+        self.session.as_mut()
+    }
+
     /// Call a Steam service method (non-authed) and wait for the response.
     ///
     /// `method` is the fully qualified method name, e.g.

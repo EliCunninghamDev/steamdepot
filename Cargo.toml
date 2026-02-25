@@ -1,5 +1,5 @@
 [workspace]
-members = ["steamdepot", "steamdepot-cli"]
+members = ["steamdepot", "steamdepot-cli", "steam-mail"]
 resolver = "2"
 
 [profile.release]
