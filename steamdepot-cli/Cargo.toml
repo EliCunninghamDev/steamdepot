@@ -7,7 +7,7 @@ license = "LGPL-2.1-only"
 repository = "https://github.com/EliCunninghamDev/stemdepot"
 
 [dependencies]
-steamdepot = { path = "../steamdepot" }
+steamdepot = { path = "../steamdepot", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

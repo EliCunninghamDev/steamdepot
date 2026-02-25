@@ -7,4 +7,4 @@ license = "LGPL-2.1-only"
 repository = "https://github.com/EliCunninghamDev/stemdepot"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt"] }
