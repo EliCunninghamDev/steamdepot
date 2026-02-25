@@ -13,6 +13,7 @@ A Rust library and CLI application for downloading from Steam content servers.
 |---|---|
 | `steamdepot` | Core library for authenticating with Steam and downloading depot content. |
 | `steamdepot-cli` | CLI frontend for `steamdepot`. |
+| `steam-mail` | Minimal SMTP server for extracting Steam Guard codes from incoming emails. |
 
 ## Usage
 
@@ -25,6 +26,9 @@ steamdepot-cli --download 232250 --fetch-manifests --install-dir /tmp/steamtest
 
 # Filter by OS and branch
 steamdepot-cli --download 232250 --os linux --branch public --fetch-manifests --install-dir /tmp/steamtest
+
+# Authenticated login with a refresh token
+steamdepot-cli --username myaccount --token 'eyAidH...' --download 3557020 --fetch-manifests --install-dir /tmp/steamtest
 
 # JSON log output (one JSON object per line)
 steamdepot-cli --logmode json --download 232250 --fetch-manifests --install-dir /tmp/steamtest
@@ -49,6 +53,23 @@ With `--logmode json`, every line is a JSON object with a `"type"` field:
 | `complete` | Depot download finished |
 | `error` | An error occurred |
 | `disconnected` | Session closed |
+
+## steam-mail
+
+`steam-mail` is a standalone crate that runs a minimal SMTP server to capture Steam Guard email codes. Point your email domain's MX record at the server, and it will extract the 5-character code from incoming Steam Guard emails.
+
+```rust
+use steam_mail::SteamMailServer;
+
+let mut server = SteamMailServer::new("0.0.0.0:2525").await?;
+println!("SMTP listening on {}", server.local_addr());
+
+// Blocks until a Steam Guard email arrives
+let code = server.recv_code().await.unwrap();
+println!("Got Steam Guard code: {}", code);
+```
+
+This is useful for automating the auth flow: call `steamdepot::login::begin_auth_session()`, wait for the guard code via `steam-mail`, then submit it with `submit_guard_code()`.
 
 ## Acknowledgements
 
