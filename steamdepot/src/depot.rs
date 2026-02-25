@@ -71,20 +71,43 @@ pub async fn prepare_download(
             }
         }
     }
+    let is_authenticated = conn.session().map(|s| s.authenticated).unwrap_or(false);
     let cached = conn.session().map(|s| &s.licensed_appids).cloned().unwrap_or_default();
     let needed: Vec<u32> = license_apps.into_iter().filter(|id| !cached.contains(id)).collect();
-    let license = if needed.is_empty() {
-        None
-    } else {
-        let result = pics::request_free_license(conn, &needed).await.ok();
+    // Only attempt free license requests for authenticated sessions.
+    // Anonymous sessions cannot claim licenses (Steam silently ignores the request).
+    if !needed.is_empty() && is_authenticated {
+        match pics::request_free_license(conn, &needed).await {
+            Ok(resp) => {
+                if resp.granted_appids.is_empty() && resp.granted_packageids.is_empty() {
+                    eprintln!(
+                        "info: free license request for apps {:?} returned no new grants \
+                         (account may already own them)",
+                        needed
+                    );
+                } else {
+                    eprintln!(
+                        "granted free licenses: apps={:?}, packages={:?}",
+                        resp.granted_appids, resp.granted_packageids
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "free license request failed for apps {:?}: {}. \
+                     The account may not have access to this app. \
+                     Ensure the free license has been claimed on the Steam account.",
+                    needed, e
+                )));
+            }
+        }
         // Cache all requested app IDs so we don't re-request
         if let Some(session) = conn.session_mut() {
             for &id in &needed {
                 session.licensed_appids.insert(id);
             }
         }
-        result
-    };
+    }
 
     let mut plans = Vec::new();
     for depot in depots {
@@ -102,8 +125,8 @@ pub async fn prepare_download(
         app_id: config.app_id,
         plans,
         cdn_servers: Vec::new(),
-        granted_appids: license.as_ref().map(|l| l.granted_appids.clone()).unwrap_or_default(),
-        granted_packageids: license.as_ref().map(|l| l.granted_packageids.clone()).unwrap_or_default(),
+        granted_appids: Vec::new(),
+        granted_packageids: Vec::new(),
     })
 }
 
