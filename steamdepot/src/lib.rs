@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod cdn;
 pub mod connection;
 pub mod crypto;

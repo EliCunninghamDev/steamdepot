@@ -86,6 +86,13 @@ pub enum GuardType {
     DeviceCode = 3,
 }
 
+impl AuthSession {
+    /// Check whether the server requires a specific guard type.
+    pub fn needs_guard(&self, guard_type: GuardType) -> bool {
+        self.allowed_confirmations.contains(&(guard_type as i32))
+    }
+}
+
 /// Tokens returned after a successful auth poll.
 pub struct AuthTokens {
     pub refresh_token: String,
