@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use serde_json::json;
@@ -330,13 +332,24 @@ impl Log {
         depot_id: u32,
         bytes_total: u64,
         p: &DownloadProgress,
+        last_pct: &AtomicU32,
+        last_human_time: &Mutex<Instant>,
     ) {
+        let pct = if bytes_total > 0 {
+            ((p.bytes_downloaded as f64 / bytes_total as f64) * 100.0).min(100.0) as u32
+        } else {
+            0
+        };
+
         if self.json() {
-            let pct = if bytes_total > 0 {
-                ((p.bytes_downloaded as f64 / bytes_total as f64) * 100.0).min(100.0) as u32
-            } else {
-                0
-            };
+            // Emit on whole-percent thresholds (sentinel u32::MAX = not yet started)
+            let prev = last_pct.load(Ordering::Relaxed);
+            if prev != u32::MAX && pct <= prev {
+                return;
+            }
+            if last_pct.compare_exchange(prev, pct, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                return; // another thread already emitted this threshold
+            }
             Self::jline(json!({
                 "type": "progress",
                 "app_id": app_id,
@@ -346,6 +359,14 @@ impl Log {
                 "pct": pct
             }));
         } else {
+            // Throttle human output to at most every 250ms
+            let mut last = last_human_time.lock().unwrap();
+            let now = Instant::now();
+            let is_final = p.chunks_done == p.chunks_total;
+            if !is_final && now.duration_since(*last).as_millis() < 250 {
+                return;
+            }
+            *last = now;
             eprint!(
                 "\r    chunks: {}/{}  bytes: {}",
                 p.chunks_done, p.chunks_total, p.bytes_downloaded,
@@ -483,6 +504,8 @@ async fn main() -> Result<()> {
                         let bytes_total =
                             manifest.metadata.cb_disk_compressed.unwrap_or(0);
                         let dl_depot_id = dp.depot.depot_id;
+                        let last_pct = Arc::new(AtomicU32::new(u32::MAX));
+                        let last_human_time = Arc::new(Mutex::new(Instant::now()));
                         let dl_result = download::download_depot(
                             &client,
                             pool,
@@ -492,7 +515,10 @@ async fn main() -> Result<()> {
                             &depot_dir,
                             8,
                             move |p| {
-                                log.progress(app_id, dl_depot_id, bytes_total, p);
+                                log.progress(
+                                    app_id, dl_depot_id, bytes_total, p,
+                                    &last_pct, &last_human_time,
+                                );
                             },
                         )
                         .await?;
