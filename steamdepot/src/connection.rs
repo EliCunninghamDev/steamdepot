@@ -210,6 +210,50 @@ impl CmConnection {
         }
     }
 
+    /// Call a Steam service method without requiring a session.
+    ///
+    /// Used for pre-auth calls like `GetPasswordRSAPublicKey` and
+    /// `BeginAuthSessionViaCredentials` where no login has happened yet.
+    pub async fn service_method_call_unauthed(
+        &mut self,
+        method: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>> {
+        let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let header = CMsgProtoBufHeader {
+            target_job_name: Some(method.to_string()),
+            jobid_source: Some(job_id),
+            ..Default::default()
+        };
+
+        self.send(
+            EMsg::ServiceMethodCallFromClientNonAuthed,
+            &header,
+            body,
+        )
+        .await?;
+
+        loop {
+            let msg = self.recv().await?;
+            if msg.emsg != EMsg::ServiceMethodResponse
+                && msg.emsg != EMsg::ServiceMethodSendToClient
+            {
+                continue;
+            }
+            if msg.header.jobid_target == Some(job_id) {
+                let eresult = msg.header.eresult.unwrap_or(2);
+                if eresult != 1 {
+                    return Err(Error::eresult(
+                        eresult,
+                        format!("service method {}", method),
+                    ));
+                }
+                return Ok(msg.body);
+            }
+        }
+    }
+
     /// Build a `CMsgProtoBufHeader` populated with the current session's
     /// steam_id and client_sessionid.
     pub fn session_header(&self) -> Result<CMsgProtoBufHeader> {

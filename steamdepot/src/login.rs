@@ -293,12 +293,21 @@ pub async fn poll_auth_status(
 }
 
 /// Login with a refresh token (the simple path for the CLI).
+///
+/// Follows the SteamKit2 pattern: sets the SteamID in the proto header
+/// and `should_remember_password` alongside the access token.
 pub async fn login_with_token(
     conn: &mut CmConnection,
     account_name: &str,
     refresh_token: &str,
 ) -> Result<SessionState> {
-    let header = CMsgProtoBufHeader::default();
+    // Extract SteamID from the JWT payload (sub claim) if possible.
+    let steam_id = extract_steamid_from_jwt(refresh_token).unwrap_or(0);
+
+    let header = CMsgProtoBufHeader {
+        steamid: if steam_id != 0 { Some(steam_id) } else { None },
+        ..Default::default()
+    };
 
     let login_id = rand_login_id();
     let body = CMsgClientLogon {
@@ -309,6 +318,7 @@ pub async fn login_with_token(
         }),
         account_name: Some(account_name.to_string()),
         access_token: Some(refresh_token.to_string()),
+        should_remember_password: Some(true),
         ..Default::default()
     };
 
@@ -316,6 +326,38 @@ pub async fn login_with_token(
         .await?;
 
     await_logon_response(conn).await
+}
+
+/// Extract the SteamID from a Steam JWT refresh token's `sub` claim.
+///
+/// Steam JWTs are base64url-encoded with three dot-separated parts.
+/// The payload (middle part) contains `"sub": "<steamid>"`.
+fn extract_steamid_from_jwt(token: &str) -> Option<u64> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    // Decode base64url payload (Steam uses standard base64 with spaces in JSON)
+    let payload = parts[1];
+    let padded = match payload.len() % 4 {
+        2 => format!("{}==", payload),
+        3 => format!("{}=", payload),
+        _ => payload.to_string(),
+    };
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &padded,
+    ).ok()?;
+    let text = std::str::from_utf8(&decoded).ok()?;
+    // Simple extraction: find "sub" : "NNNNN"
+    let sub_pos = text.find("\"sub\"")?;
+    let after = &text[sub_pos + 5..];
+    let colon = after.find(':')?;
+    let after_colon = &after[colon + 1..];
+    let quote_start = after_colon.find('"')? + 1;
+    let rest = &after_colon[quote_start..];
+    let quote_end = rest.find('"')?;
+    rest[..quote_end].parse().ok()
 }
 
 // -------------------------------------------------------------------------
