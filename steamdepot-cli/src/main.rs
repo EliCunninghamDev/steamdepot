@@ -544,11 +544,10 @@ async fn main() -> Result<()> {
                     log.file_listing(&manifest.payload.mappings);
 
                     if let Some(ref install_dir) = cli.install_dir {
-                        let depot_dir = install_dir.join(dp.depot.depot_id.to_string());
-                        log.prepare(app_id, dp.depot.depot_id, &depot_dir);
+                        log.prepare(app_id, dp.depot.depot_id, install_dir);
 
                         let result =
-                            download::prepare_directory_tree(&depot_dir, manifest).await?;
+                            download::prepare_directory_tree(install_dir, manifest).await?;
                         log.prepared(app_id, dp.depot.depot_id, &result);
 
                         let pool = Arc::new(Mutex::new(CdnPool::new(plan.cdn_servers.clone())));
@@ -565,7 +564,7 @@ async fn main() -> Result<()> {
                             dp.depot.depot_id,
                             manifest,
                             &dp.key,
-                            &depot_dir,
+                            install_dir,
                             8,
                             move |p| {
                                 log.progress(
