@@ -298,10 +298,10 @@ pub fn resolve_depots(
         };
 
         // Filter by OS — no oslist means all platforms.
-        if let Some(oslist) = depot.get("config").and_then(|c| c.get_str("oslist")) {
-            if !oslist.split(',').any(|o| o.trim() == os) {
-                continue;
-            }
+        if let Some(oslist) = depot.get("config").and_then(|c| c.get_str("oslist"))
+            && !oslist.split(',').any(|o| o.trim() == os)
+        {
+            continue;
         }
 
         let manifests = match depot.get("manifests") {

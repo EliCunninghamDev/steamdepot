@@ -131,8 +131,8 @@ pub async fn prepare_directory_tree(
                 tokio::fs::create_dir_all(parent).await?;
             }
             // Remove existing file/symlink if present
-            let _ = tokio::fs::remove_file(&path).await;
-            tokio::fs::symlink(target, &path).await?;
+            remove_existing(&path).await;
+            create_symlink(target, &path).await?;
             result.symlinks_created += 1;
         } else {
             // Regular file
@@ -166,6 +166,46 @@ pub async fn prepare_directory_tree(
     }
 
     Ok(result)
+}
+
+/// Remove a file or symlink at `path`, ignoring errors.
+///
+/// On Windows a directory symlink has to be removed with `remove_dir`, so both
+/// are attempted.
+async fn remove_existing(path: &Path) {
+    if tokio::fs::remove_file(path).await.is_err() {
+        let _ = tokio::fs::remove_dir(path).await;
+    }
+}
+
+/// Create a symlink at `path` pointing at `target`.
+///
+/// Unix has a single `symlink` call. Windows needs to know whether the target
+/// is a file or a directory; Steam manifests do not record that, so a file link
+/// is tried first and a directory link is used as the fallback.
+async fn create_symlink(target: &str, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(target, path).await?;
+    }
+
+    #[cfg(windows)]
+    {
+        match tokio::fs::symlink_file(target, path).await {
+            Ok(()) => {}
+            Err(_) => tokio::fs::symlink_dir(target, path).await?,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, path);
+        return Err(Error::Other(
+            "symlinks are not supported on this platform".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Ensure an existing file can be opened for writing.
@@ -521,7 +561,7 @@ fn decompress_vzstd(data: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::Other("VZstd data too short".into()));
     }
     let zstd_data = &data[8..data.len() - 15];
-    let mut decoder = ruzstd::StreamingDecoder::new(zstd_data)
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(zstd_data)
         .map_err(|e| Error::Other(format!("VZstd init: {}", e)))?;
     let mut output = Vec::new();
     std::io::Read::read_to_end(&mut decoder, &mut output)?;

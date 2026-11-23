@@ -5,7 +5,7 @@ conventions the CI pipeline enforces.
 
 ## Setup
 
-- Rust **1.85 or newer** (edition 2024). `rust-toolchain.toml` pins `stable`.
+- Rust **1.89 or newer** (edition 2024). `rust-toolchain.toml` pins `stable`.
 - Git submodules. The protobuf definitions live in `steamdepot/proto`:
 
   ```bash

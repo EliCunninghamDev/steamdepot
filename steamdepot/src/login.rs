@@ -120,19 +120,18 @@ pub async fn get_password_rsa_key(conn: &mut CmConnection, account_name: &str) -
 
 /// Encrypt a password using the RSA public key from Steam.
 pub fn encrypt_password(password: &str, rsa_key: &RsaKey) -> Result<String> {
-    use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
+    use rsa::{BoxedUint, PublicKey};
 
-    let n = BigUint::parse_bytes(rsa_key.modulus.as_bytes(), 16)
-        .ok_or_else(|| Error::Other("invalid RSA modulus".into()))?;
-    let e = BigUint::parse_bytes(rsa_key.exponent.as_bytes(), 16)
-        .ok_or_else(|| Error::Other("invalid RSA exponent".into()))?;
+    let n = BoxedUint::from_str_radix_vartime(&rsa_key.modulus, 16)
+        .map_err(|e| Error::Other(format!("invalid RSA modulus: {e}")))?;
+    let e = BoxedUint::from_str_radix_vartime(&rsa_key.exponent, 16)
+        .map_err(|e| Error::Other(format!("invalid RSA exponent: {e}")))?;
 
     let pub_key =
-        RsaPublicKey::new(n, e).map_err(|e| Error::Other(format!("invalid RSA key: {}", e)))?;
+        PublicKey::new(n, e).map_err(|e| Error::Other(format!("invalid RSA key: {}", e)))?;
 
-    let mut rng = rsa::rand_core::OsRng;
     let encrypted = pub_key
-        .encrypt(&mut rng, Pkcs1v15Encrypt, password.as_bytes())
+        .pkcs1v15_encrypt(password.as_bytes())
         .map_err(|e| Error::Other(format!("RSA encrypt failed: {}", e)))?;
 
     Ok(base64::Engine::encode(
@@ -396,7 +395,7 @@ async fn await_logon_response(conn: &mut CmConnection) -> Result<SessionState> {
 mod tests {
     use base64::Engine;
     use rsa::traits::PublicKeyParts;
-    use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+    use rsa::{Pkcs1v15Encrypt, PrivateKey, PublicKey};
 
     use super::*;
 
@@ -430,12 +429,12 @@ mod tests {
 
     #[test]
     fn encrypts_password_with_steam_rsa_format() {
-        let mut rng = rsa::rand_core::OsRng;
-        let private = RsaPrivateKey::new(&mut rng, 1024).unwrap();
-        let public = RsaPublicKey::from(&private);
+        let mut rng = getrandom::SysRng;
+        let private = PrivateKey::new(&mut rng, 1024).unwrap();
+        let public = PublicKey::from(&private);
         let key = RsaKey {
-            modulus: public.n().to_str_radix(16),
-            exponent: public.e().to_str_radix(16),
+            modulus: public.n().to_string_radix_vartime(16),
+            exponent: public.e().to_string_radix_vartime(16),
             timestamp: 123,
         };
 

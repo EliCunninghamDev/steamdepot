@@ -4,10 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
-## [Unreleased]
+## [0.4.1] - 2026-11-23
+
+### Changed
+
+- Updated workspace dependencies to their latest releases: `aes` 0.9,
+  `base64` 0.23, `cbc` 0.2, `prost`/`prost-build` 0.14, `reqwest` 0.13,
+  `rsa` 0.10, `ruzstd` 0.9, `tokio-tungstenite` 0.30, and `zip` 9. The code was
+  migrated off the deprecated APIs these releases removed (`aes`/`cbc` trait
+  and padded-block changes, `rsa::BigUint` and PKCS#1 v1.5 helpers, and
+  `ruzstd::StreamingDecoder` moving under `ruzstd::decoding`).
+- The minimum supported Rust version is now 1.89, required by the updated
+  `aes` and `zip` releases.
+- CI actions updated to `actions/checkout` v7, `actions/upload-artifact` v7,
+  `actions/download-artifact` v8, and `softprops/action-gh-release` v3.
 
 ### Fixed
 
+- Windows builds: symlink creation now uses the Windows-specific
+  `symlink_file`/`symlink_dir` calls instead of the Unix-only `symlink`.
 - Regular file permissions are now derived from the manifest on every download:
   the executable flag is applied in both directions (a stale `+x` from an older
   manifest is cleared) and the read-only flag is honored. Read-only files are

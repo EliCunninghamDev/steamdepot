@@ -1,7 +1,7 @@
 use aes::Aes256;
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use base64::Engine;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 
 use crate::error::{Error, Result};
 
@@ -28,7 +28,10 @@ pub fn aes_ecb_decrypt(key: &[u8], input: &[u8]) -> Result<Vec<u8>> {
 
     let mut output = input.to_vec();
     for i in (0..output.len()).step_by(16) {
-        cipher.decrypt_block(aes::Block::from_mut_slice(&mut output[i..i + 16]));
+        let block: &mut aes::Block = (&mut output[i..i + 16])
+            .try_into()
+            .expect("16-byte AES block");
+        cipher.decrypt_block(block);
     }
 
     // Remove PKCS7 padding
@@ -68,7 +71,7 @@ pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| Error::Other(format!("AES-CBC init: {}", e)))?;
 
     let plaintext = decryptor
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .decrypt_padded::<Pkcs7>(&mut buf)
         .map_err(|e| Error::Other(format!("AES-CBC decrypt: {}", e)))?;
 
     Ok(plaintext.to_vec())
@@ -140,14 +143,15 @@ fn aes_ecb_decrypt_block(key: &[u8], block: &[u8]) -> Result<Vec<u8>> {
 
     let mut output = [0u8; 16];
     output.copy_from_slice(block);
-    cipher.decrypt_block(aes::Block::from_mut_slice(&mut output));
+    let block: &mut aes::Block = (&mut output[..]).try_into().expect("16-byte AES block");
+    cipher.decrypt_block(block);
     Ok(output.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use aes::Aes256;
-    use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyIvInit};
+    use aes::cipher::{BlockCipherEncrypt, BlockModeEncrypt, KeyIvInit};
 
     use super::*;
 
@@ -164,7 +168,9 @@ mod tests {
         let pad = 16 - (buf.len() % 16);
         buf.extend(std::iter::repeat_n(pad as u8, pad));
         for i in (0..buf.len()).step_by(16) {
-            cipher.encrypt_block(aes::Block::from_mut_slice(&mut buf[i..i + 16]));
+            let block: &mut aes::Block =
+                (&mut buf[i..i + 16]).try_into().expect("16-byte AES block");
+            cipher.encrypt_block(block);
         }
         buf
     }
@@ -172,7 +178,8 @@ mod tests {
     fn ecb_encrypt_block(block: &[u8; 16]) -> [u8; 16] {
         let cipher = Aes256::new_from_slice(&KEY).unwrap();
         let mut out = *block;
-        cipher.encrypt_block(aes::Block::from_mut_slice(&mut out));
+        let block: &mut aes::Block = (&mut out[..]).try_into().expect("16-byte AES block");
+        cipher.encrypt_block(block);
         out
     }
 
@@ -181,7 +188,7 @@ mod tests {
         let mut buf = vec![0u8; plaintext.len() + 16];
         buf[..plaintext.len()].copy_from_slice(plaintext);
         let len = enc
-            .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf, plaintext.len())
+            .encrypt_padded::<aes::cipher::block_padding::Pkcs7>(&mut buf, plaintext.len())
             .unwrap()
             .len();
         buf.truncate(len);

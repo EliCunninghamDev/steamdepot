@@ -5,7 +5,7 @@
 
 A Rust library and CLI application for downloading from Steam content servers.
 
-MSRV: **Rust 1.85** (edition 2024).
+MSRV: **Rust 1.89** (edition 2024).
 
 ## Goals
 

@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aes::Aes256;
-use aes::cipher::{BlockEncrypt, KeyInit};
-use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockCipherEncrypt, BlockModeEncrypt, KeyInit};
+use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use steamdepot::emsg::EMsg;
@@ -370,13 +370,14 @@ pub fn zip_blob(name: &str, data: &[u8]) -> Vec<u8> {
 pub fn encrypt_chunk(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
     let cipher = Aes256::new_from_slice(key).unwrap();
     let mut iv_ct = *iv;
-    cipher.encrypt_block(aes::Block::from_mut_slice(&mut iv_ct));
+    let block: &mut aes::Block = (&mut iv_ct[..]).try_into().expect("16-byte AES block");
+    cipher.encrypt_block(block);
 
     let encryptor = cbc::Encryptor::<Aes256>::new_from_slices(key, iv).unwrap();
     let mut buf = vec![0u8; plaintext.len() + 16];
     buf[..plaintext.len()].copy_from_slice(plaintext);
     let len = encryptor
-        .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+        .encrypt_padded::<Pkcs7>(&mut buf, plaintext.len())
         .unwrap()
         .len();
     buf.truncate(len);
