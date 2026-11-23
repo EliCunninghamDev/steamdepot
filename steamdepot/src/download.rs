@@ -1,5 +1,5 @@
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,7 +10,9 @@ use crate::cdn::{CdnPool, DepotManifest};
 use crate::crypto;
 use crate::error::{Error, Result};
 
+#[cfg_attr(not(unix), allow(dead_code))] // only used to set the exec bit on Unix
 const FLAG_EXECUTABLE: u32 = 0x20;
+const FLAG_READONLY: u32 = 0x08;
 const FLAG_DIRECTORY: u32 = 0x40;
 const FLAG_SYMLINK: u32 = 0x200;
 
@@ -44,10 +46,46 @@ pub fn decrypt_manifest_filenames(manifest: &mut DepotManifest, key: &[u8]) -> R
     Ok(())
 }
 
+/// Join a manifest filename onto the install directory.
+///
+/// Manifest filenames are attacker-controlled data (they come from Steam, but
+/// also from any mirror). Absolute paths, drive prefixes, and `..` components
+/// are rejected so a manifest cannot write outside the install directory.
+fn safe_join(root: &Path, filename: &str) -> Result<PathBuf> {
+    let normalized = filename.replace('\\', "/");
+    let mut out = root.to_path_buf();
+    let mut pushed = false;
+
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(part) => {
+                out.push(part);
+                pushed = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::Other(format!(
+                    "unsafe path in manifest: {filename:?}"
+                )));
+            }
+        }
+    }
+
+    if !pushed {
+        return Err(Error::Other(format!(
+            "empty path in manifest: {filename:?}"
+        )));
+    }
+
+    Ok(out)
+}
+
 /// Create the directory tree and pre-allocate files at their final sizes.
 ///
 /// Handles directories (flag 0x40), symlinks (flag 0x200), and regular files.
-/// For regular files, sets executable permission when flag 0x20 is set.
+/// Regular file modes are derived from the manifest flags: executable (0x20)
+/// files become `0755`, read-only (0x08) files lose their write bits on Unix
+/// (see `apply_file_flags`). Read-only is deferred until the chunks are on disk.
 pub async fn prepare_directory_tree(
     install_dir: &Path,
     manifest: &DepotManifest,
@@ -75,9 +113,7 @@ pub async fn prepare_directory_tree(
         let flags = mapping.flags.unwrap_or(0);
         let size = mapping.size.unwrap_or(0);
 
-        // Normalize path separators (manifests may use backslashes)
-        let normalized = filename.replace('\\', "/");
-        let path = install_dir.join(&normalized);
+        let path = safe_join(install_dir, filename)?;
 
         if flags & FLAG_DIRECTORY != 0 {
             tokio::fs::create_dir_all(&path).await?;
@@ -103,21 +139,104 @@ pub async fn prepare_directory_tree(
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let file = tokio::fs::File::create(&path).await?;
+            let file = match tokio::fs::File::create(&path).await {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // A read-only file from an earlier download has to be made
+                    // writable before it can be truncated.
+                    make_writable(&path).await?;
+                    tokio::fs::File::create(&path).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             file.set_len(size).await?;
             result.files_created += 1;
             result.total_bytes += size;
 
-            // Set executable permission
-            if flags & FLAG_EXECUTABLE != 0 {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o755);
-                tokio::fs::set_permissions(&path, perms).await?;
-            }
+            // Apply the manifest mode now so stale bits are cleared. Files that
+            // still need chunks stay writable; `download_depot` reapplies the
+            // full mode after the last chunk is written.
+            let flags = if mapping.chunks.is_empty() {
+                flags
+            } else {
+                flags & !FLAG_READONLY
+            };
+            apply_file_flags(&path, flags).await?;
         }
     }
 
     Ok(result)
+}
+
+/// Ensure an existing file can be opened for writing.
+///
+/// Files marked read-only in a previous download are `0444` on Unix (and carry
+/// the read-only attribute on Windows), which makes truncating them fail.
+async fn make_writable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let perms = tokio::fs::metadata(path).await?.permissions();
+        if perms.mode() & 0o200 == 0 {
+            let mode = perms.mode() | 0o200;
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut perms = tokio::fs::metadata(path).await?.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            tokio::fs::set_permissions(path, perms).await?;
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+
+    Ok(())
+}
+
+/// Rewrite a regular file's mode from its manifest flags.
+///
+/// The mode is derived from scratch on every download, so a file that loses
+/// the executable (0x20) or read-only (0x08) flag in a newer manifest does not
+/// keep a stale permission bit.
+///
+/// On Unix the result is `0644` (`0755` when executable), with every write bit
+/// cleared for read-only files. The hidden flag (0x10) only maps to a Windows
+/// file attribute that `std` cannot set, so it is ignored on every platform.
+async fn apply_file_flags(path: &Path, flags: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut mode = 0o644;
+        if flags & FLAG_EXECUTABLE != 0 {
+            mode |= 0o111;
+        }
+        if flags & FLAG_READONLY != 0 {
+            mode &= !0o222;
+        }
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+    }
+
+    #[cfg(windows)]
+    {
+        let read_only = flags & FLAG_READONLY != 0;
+        let mut perms = tokio::fs::metadata(path).await?.permissions();
+        if perms.readonly() != read_only {
+            perms.set_readonly(read_only);
+            tokio::fs::set_permissions(path, perms).await?;
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    let _ = (path, flags);
+
+    Ok(())
 }
 
 /// Progress report for chunk downloads.
@@ -141,6 +260,7 @@ struct ChunkJob {
 /// Flattens all chunks across all files into a work queue and processes them
 /// with bounded concurrency. Each chunk is retried up to `MAX_RETRIES` times,
 /// penalizing the failing server in the pool on transient errors.
+#[allow(clippy::too_many_arguments)] // public entry point; splitting would churn the API
 pub async fn download_depot(
     client: &reqwest::Client,
     pool: Arc<Mutex<CdnPool>>,
@@ -166,8 +286,7 @@ pub async fn download_depot(
             continue;
         }
 
-        let normalized = filename.replace('\\', "/");
-        let path = install_dir.join(&normalized);
+        let path = safe_join(install_dir, filename)?;
 
         for chunk in &mapping.chunks {
             let sha_bytes = chunk.sha.as_deref().unwrap_or(&[]);
@@ -199,14 +318,8 @@ pub async fn download_depot(
         let on_progress = on_progress.clone();
 
         join_set.spawn(async move {
-            let result = download_chunk_with_retry(
-                &client,
-                &pool,
-                depot_id,
-                &job,
-                &depot_key,
-            )
-            .await;
+            let result =
+                download_chunk_with_retry(&client, &pool, depot_id, &job, &depot_key).await;
             drop(permit);
 
             match result {
@@ -240,6 +353,19 @@ pub async fn download_depot(
         }
     }
 
+    // Now that every chunk is on disk, apply the final mode from the manifest
+    // (read-only files were kept writable until this point).
+    for mapping in &manifest.payload.mappings {
+        let flags = mapping.flags.unwrap_or(0);
+        if flags & (FLAG_DIRECTORY | FLAG_SYMLINK) != 0 {
+            continue;
+        }
+        if let Some(filename) = mapping.filename.as_deref() {
+            let path = safe_join(install_dir, filename)?;
+            apply_file_flags(&path, flags).await?;
+        }
+    }
+
     Ok(DownloadProgress {
         chunks_done: chunks_done.load(Ordering::Relaxed),
         chunks_total,
@@ -266,10 +392,7 @@ async fn download_chunk_with_retry(
                 .map(|t| t.token.clone());
             (server, token)
         };
-        let mut url = format!(
-            "https://{}/depot/{}/chunk/{}",
-            server.vhost, depot_id, job.sha_hex
-        );
+        let mut url = server.url(&format!("/depot/{}/chunk/{}", depot_id, job.sha_hex));
         if let Some(ref token) = cdn_token {
             url.push_str(token);
         }
@@ -343,8 +466,12 @@ fn is_retryable(e: &Error) -> bool {
         }
         Error::Other(msg) => {
             // Retryable HTTP status errors surfaced via error_for_status
-            msg.contains("403") || msg.contains("500") || msg.contains("502")
-                || msg.contains("503") || msg.contains("404") || msg.contains("429")
+            msg.contains("403")
+                || msg.contains("500")
+                || msg.contains("502")
+                || msg.contains("503")
+                || msg.contains("404")
+                || msg.contains("429")
         }
         _ => false,
     }
@@ -365,8 +492,8 @@ fn decompress_chunk(data: &[u8]) -> Result<Vec<u8>> {
     } else if data.len() >= 4 && &data[..4] == b"PK\x03\x04" {
         // ZIP-compressed chunk (rare)
         let cursor = std::io::Cursor::new(data);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| Error::Other(format!("chunk zip: {}", e)))?;
+        let mut archive =
+            zip::ZipArchive::new(cursor).map_err(|e| Error::Other(format!("chunk zip: {}", e)))?;
         let mut file = archive
             .by_index(0)
             .map_err(|e| Error::Other(format!("chunk zip entry: {}", e)))?;
@@ -381,11 +508,14 @@ fn decompress_chunk(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decompress a VZstd chunk.
 ///
-/// VZstdUtil.cs layout:
-///   [0..4]   'V' 'S' 'Z' 'a' magic
-///   [4..8]   CRC32
-///   [8..-15] Zstd compressed stream
-///   [-15..]  footer (CRC32 + decompressed size + "zsv")
+/// `VZstdUtil.cs` layout:
+///
+/// ```text
+/// [0..4]   'V' 'S' 'Z' 'a' magic
+/// [4..8]   CRC32
+/// [8..-15] Zstd compressed stream
+/// [-15..]  footer (CRC32 + decompressed size + "zsv")
+/// ```
 fn decompress_vzstd(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 8 + 15 {
         return Err(Error::Other("VZstd data too short".into()));
@@ -400,13 +530,16 @@ fn decompress_vzstd(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decompress a VZip (LZMA) chunk.
 ///
-/// VZipUtil.cs layout:
-///   [0..2]   'V' 'Z' magic
-///   [2]      'a' version
-///   [3..7]   CRC32 / timestamp
-///   [7..12]  LZMA properties (1 byte props + 4 byte dict size)
-///   [12..-10] LZMA compressed data
-///   [-10..]  footer (CRC32 + decompressed size + "vz")
+/// `VZipUtil.cs` layout:
+///
+/// ```text
+/// [0..2]   'V' 'Z' magic
+/// [2]      'a' version
+/// [3..7]   CRC32 / timestamp
+/// [7..12]  LZMA properties (1 byte props + 4 byte dict size)
+/// [12..-10] LZMA compressed data
+/// [-10..]  footer (CRC32 + decompressed size + "vz")
+/// ```
 fn decompress_vzip_lzma(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 12 + 10 {
         return Err(Error::Other("VZip data too short".into()));
@@ -471,4 +604,227 @@ fn adler32_steam(data: &[u8]) -> u32 {
     }
 
     (s2 << 16) | s1
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use crate::proto::{
+        ContentManifestMetadata, ContentManifestPayload, ContentManifestSignature,
+        content_manifest_payload,
+    };
+
+    use super::*;
+
+    fn manifest(mappings: Vec<content_manifest_payload::FileMapping>) -> DepotManifest {
+        DepotManifest {
+            payload: ContentManifestPayload { mappings },
+            metadata: ContentManifestMetadata::default(),
+            signature: ContentManifestSignature::default(),
+        }
+    }
+
+    fn file(name: &str, size: u64, flags: u32) -> content_manifest_payload::FileMapping {
+        content_manifest_payload::FileMapping {
+            filename: Some(name.into()),
+            size: Some(size),
+            flags: Some(flags),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_escape_attempts() {
+        let root = Path::new("/tmp/install");
+        assert_eq!(
+            safe_join(root, "a\\b/c.txt").unwrap(),
+            Path::new("/tmp/install/a/b/c.txt")
+        );
+        assert_eq!(
+            safe_join(root, "./a/./b").unwrap(),
+            Path::new("/tmp/install/a/b")
+        );
+
+        for bad in [
+            "../escape",
+            "a/../../escape",
+            "/etc/passwd",
+            "..\\escape",
+            "",
+        ] {
+            assert!(
+                safe_join(root, bad).is_err(),
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn adler32_matches_steam_seed_variant() {
+        assert_eq!(adler32_steam(b""), 0);
+        assert_eq!(adler32_steam(b"abc"), 0x024A_0126);
+        assert!(verify_adler32(b"abc", 0).is_ok());
+        assert!(verify_adler32(b"abc", 0x024A_0126).is_ok());
+        assert!(verify_adler32(b"abc", 0x1234_5678).is_err());
+    }
+
+    #[test]
+    fn decompresses_uncompressed_and_zipped_chunks() {
+        assert_eq!(decompress_chunk(b"plain bytes").unwrap(), b"plain bytes");
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("chunk", options).unwrap();
+            writer.write_all(b"zipped bytes").unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(decompress_chunk(buf.get_ref()).unwrap(), b"zipped bytes");
+    }
+
+    #[test]
+    fn rejects_truncated_compressed_chunks() {
+        assert!(decompress_chunk(b"VSZa").is_err());
+        assert!(decompress_chunk(b"VZa").is_err());
+        assert!(decompress_chunk(b"PK\x03\x04 broken").is_err());
+    }
+
+    #[tokio::test]
+    async fn prepares_directories_files_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mappings = vec![
+            file("data", 0, FLAG_DIRECTORY),
+            file("data/bin/server", 4, FLAG_EXECUTABLE),
+        ];
+
+        #[cfg(unix)]
+        let mappings = {
+            let mut mappings = mappings;
+            let mut link = file("data/link", 0, FLAG_SYMLINK);
+            link.linktarget = Some("bin/server".into());
+            mappings.push(link);
+            mappings
+        };
+
+        let result = prepare_directory_tree(dir.path(), &manifest(mappings))
+            .await
+            .unwrap();
+        assert_eq!(result.dirs_created, 1);
+        assert_eq!(result.files_created, 1);
+        assert_eq!(result.total_bytes, 4);
+
+        #[cfg(unix)]
+        assert_eq!(result.symlinks_created, 1);
+        #[cfg(not(unix))]
+        assert_eq!(result.symlinks_created, 0);
+
+        let server = dir.path().join("data/bin/server");
+        assert_eq!(std::fs::metadata(&server).unwrap().len(), 4);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&server).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(
+                std::fs::read_link(dir.path().join("data/link")).unwrap(),
+                Path::new("bin/server")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn derives_file_modes_from_manifest_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Simulate a file left executable by an older download.
+        let stale = dir.path().join("stale");
+        tokio::fs::write(&stale, b"x").await.unwrap();
+        tokio::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let manifest = manifest(vec![
+            file("stale", 1, 0),
+            file("tool", 0, FLAG_EXECUTABLE),
+            file("locked", 0, FLAG_READONLY),
+            file("locked_tool", 0, FLAG_EXECUTABLE | FLAG_READONLY),
+        ]);
+        prepare_directory_tree(dir.path(), &manifest).await.unwrap();
+
+        let mode = |name: &str| {
+            std::fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        assert_eq!(mode("stale"), 0o644, "stale exec bit was not cleared");
+        assert_eq!(mode("tool"), 0o755);
+        assert_eq!(mode("locked"), 0o444);
+        assert_eq!(mode("locked_tool"), 0o555);
+    }
+
+    #[tokio::test]
+    async fn re_prepares_read_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest(vec![file("locked", 2, FLAG_READONLY)]);
+
+        prepare_directory_tree(dir.path(), &manifest).await.unwrap();
+        let result = prepare_directory_tree(dir.path(), &manifest).await.unwrap();
+        assert_eq!(result.files_created, 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("locked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o444);
+        }
+        #[cfg(windows)]
+        assert!(
+            std::fs::metadata(dir.path().join("locked"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_write_outside_the_install_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest(vec![file("../escaped.txt", 1, 0)]);
+
+        let err = prepare_directory_tree(dir.path(), &manifest)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsafe path"), "{err}");
+        assert!(!dir.path().parent().unwrap().join("escaped.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn requires_a_target_for_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest(vec![file("dangling", 0, FLAG_SYMLINK)]);
+
+        let err = prepare_directory_tree(dir.path(), &manifest)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no linktarget"), "{err}");
+    }
 }

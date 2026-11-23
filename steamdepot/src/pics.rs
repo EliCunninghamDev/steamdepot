@@ -4,12 +4,11 @@ use crate::connection::CmConnection;
 use crate::emsg::EMsg;
 use crate::error::{Error, Result};
 use crate::proto::{
-    c_msg_client_pics_product_info_request as req_types,
     CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
     CMsgClientPicsAccessTokenRequest, CMsgClientPicsAccessTokenResponse,
     CMsgClientPicsProductInfoRequest as PicsRequest,
-    CMsgClientPicsProductInfoResponse as PicsResponse,
-    CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse,
+    CMsgClientPicsProductInfoResponse as PicsResponse, CMsgClientRequestFreeLicense,
+    CMsgClientRequestFreeLicenseResponse, c_msg_client_pics_product_info_request as req_types,
 };
 
 /// Returned product info for a single app.
@@ -213,14 +212,19 @@ pub async fn get_depot_decryption_key(
             let reason = match eresult {
                 2 => "invalid depot/app combination",
                 5 => "access denied — account doesn't own this app/depot",
-                15 => "access denied — the account does not have a license for this app. \
-                       If this is a free game, claim the free license on the Steam account first",
+                15 => {
+                    "access denied — the account does not have a license for this app. \
+                       If this is a free game, claim the free license on the Steam account first"
+                }
                 9 => "file not found — depot does not exist",
                 _ => "unexpected error",
             };
             return Err(Error::eresult(
                 eresult,
-                format!("depot {} (app {}) decryption key: {}", depot_id, app_id, reason),
+                format!(
+                    "depot {} (app {}) decryption key: {}",
+                    depot_id, app_id, reason
+                ),
             ));
         }
 

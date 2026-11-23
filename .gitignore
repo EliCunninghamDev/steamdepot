@@ -1,2 +1,24 @@
+# Build artifacts
 /target
+**/*.rs.bk
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Coverage and profiling output
+*.profraw
+*.profdata
+lcov.info
+/coverage
+/flamegraph.svg
+
+# Agent/editor scratch space
 .claude

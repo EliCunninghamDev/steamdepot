@@ -1,6 +1,11 @@
 # steamdepot-rs
 
+[![CI](https://github.com/EliCunninghamDev/steamdepot/actions/workflows/ci.yml/badge.svg)](https://github.com/EliCunninghamDev/steamdepot/actions/workflows/ci.yml)
+[![License: LGPL-2.1](https://img.shields.io/badge/license-LGPL--2.1-blue.svg)](LICENSE)
+
 A Rust library and CLI application for downloading from Steam content servers.
+
+MSRV: **Rust 1.85** (edition 2024).
 
 ## Goals
 
@@ -70,6 +75,38 @@ println!("Got Steam Guard code: {}", code);
 ```
 
 This is useful for automating the auth flow: call `steamdepot::login::begin_auth_session()`, wait for the guard code via `steam-mail`, then submit it with `submit_guard_code()`.
+
+## Development
+
+```bash
+# Clone with the protobuf submodule (required for the build)
+git clone --recurse-submodules https://github.com/EliCunninghamDev/steamdepot.git
+cd steamdepot
+
+# Run every check CI runs (fmt, clippy, tests, docs)
+./scripts/ci.sh
+```
+
+`protoc` is vendored through `protoc-bin-vendored`, so no system protobuf
+compiler is required. `cargo test` is fully offline: protocol and CDN tests run
+against a local mock CM (WebSocket) and a local mock CDN (HTTP).
+
+| Test suite | Location | Network |
+|---|---|---|
+| Unit tests | `steamdepot/src/**`, `steam-mail/src/lib.rs`, `steamdepot-cli/src/main.rs` | no |
+| Mock CM protocol tests | `steamdepot/tests/mock_cm.rs` | no |
+| Mock CDN download tests | `steamdepot/tests/cdn_download.rs` | no |
+| CLI behavior tests | `steamdepot-cli/tests/cli.rs` | no |
+| Live Steam tests | `steamdepot/tests/live_steam.rs` | yes (`#[ignore]`) |
+
+Live tests are ignored by default. To run them against real Steam servers:
+
+```bash
+cp .env.example .env   # fill in optional credentials
+./scripts/test-live.sh
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
 
 ## Acknowledgements
 

@@ -76,3 +76,33 @@ impl EMsg {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_known_values() {
+        let cases = [
+            (1u32, EMsg::Multi),
+            (703, EMsg::ClientHeartBeat),
+            (5514, EMsg::ClientLogon),
+            (751, EMsg::ClientLogOnResponse),
+            (8904, EMsg::ClientPICSProductInfoResponse),
+            (5438, EMsg::ClientGetDepotDecryptionKey),
+            (9804, EMsg::ServiceMethodCallFromClientNonAuthed),
+            (9805, EMsg::ServiceMethodResponse),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(EMsg::from_u32(raw), Some(expected));
+            assert_eq!(expected as u32, raw);
+        }
+    }
+
+    #[test]
+    fn unknown_values_are_none() {
+        assert_eq!(EMsg::from_u32(0), None);
+        assert_eq!(EMsg::from_u32(999_999), None);
+    }
+}

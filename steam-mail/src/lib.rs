@@ -43,7 +43,10 @@ impl SteamMailServer {
             }
         });
 
-        Ok(Self { item_rx, local_addr })
+        Ok(Self {
+            item_rx,
+            local_addr,
+        })
     }
 
     /// The local address this server is bound to.
@@ -97,8 +100,9 @@ async fn handle_smtp(
         if in_data {
             if line == "." {
                 in_data = false;
-                // Decode quoted-printable if the email uses it
-                let decoded = decode_quoted_printable(&body);
+                // Decode quoted-printable only when the message declares it;
+                // literal '=' in an unencoded body must not be mangled.
+                let decoded = decode_body(&body);
                 // Try guard code first, then verification link
                 if let Some(code) = extract_guard_code(&decoded) {
                     let _ = item_tx.send(SteamMailItem::GuardCode(code)).await;
@@ -117,9 +121,7 @@ async fn handle_smtp(
         let upper = line.to_ascii_uppercase();
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
             writer.write_all(b"250 Hello\r\n").await?;
-        } else if upper.starts_with("MAIL FROM") {
-            writer.write_all(b"250 OK\r\n").await?;
-        } else if upper.starts_with("RCPT TO") {
+        } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
             writer.write_all(b"250 OK\r\n").await?;
         } else if upper == "DATA" {
             writer
@@ -140,11 +142,31 @@ async fn handle_smtp(
     Ok(())
 }
 
+/// Decode a message body according to its `Content-Transfer-Encoding` header.
+///
+/// Only bodies that explicitly declare `quoted-printable` are decoded. Applying
+/// QP unconditionally would corrupt literal `=` characters in plain bodies.
+fn decode_body(body: &str) -> String {
+    let declares_qp = body
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with("content-transfer-encoding:") && lower.contains("quoted-printable")
+        });
+
+    if declares_qp {
+        decode_quoted_printable(body)
+    } else {
+        body.to_string()
+    }
+}
+
 /// Decode quoted-printable encoded text.
 ///
 /// In SMTP emails, `=` is encoded as `=3D`, soft line breaks as `=\n`, etc.
 fn decode_quoted_printable(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -159,19 +181,16 @@ fn decode_quoted_printable(input: &str) -> String {
                 continue;
             }
             // Hex-encoded byte
-            if let (Some(hi), Some(lo)) = (
-                hex_val(bytes[i + 1]),
-                hex_val(bytes[i + 2]),
-            ) {
-                out.push((hi << 4 | lo) as char);
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -191,16 +210,19 @@ fn extract_verification_link(body: &str) -> Option<String> {
     for line in body.lines() {
         let trimmed = line.trim();
         // Look for Steam URLs — could be in HTML href or plain text
-        for segment in trimmed.split(|c: char| c == '"' || c == '\'' || c == ' ' || c == '<' || c == '>') {
+        for segment in trimmed.split(['"', '\'', ' ', '<', '>']) {
             let s = segment.trim();
             if (s.starts_with("https://store.steampowered.com/")
                 || s.starts_with("https://help.steampowered.com/")
                 || s.starts_with("https://login.steampowered.com/"))
-                && (s.contains("verify") || s.contains("confirm") || s.contains("newaccountverification")
-                    || s.contains("login/emailconf") || s.contains("creationconfirm"))
+                && (s.contains("verify")
+                    || s.contains("confirm")
+                    || s.contains("newaccountverification")
+                    || s.contains("login/emailconf")
+                    || s.contains("creationconfirm"))
             {
                 // Trim any trailing HTML/punctuation
-                let url = s.trim_end_matches(|c: char| c == '"' || c == '\'' || c == '>' || c == ';');
+                let url = s.trim_end_matches(['"', '\'', '>', ';']);
                 return Some(url.to_string());
             }
         }
@@ -222,8 +244,9 @@ fn extract_guard_code(body: &str) -> Option<String> {
         if let Some(pos) = trimmed.to_ascii_lowercase().find("code") {
             let after = &trimmed[pos + 4..];
             // Skip "is", ":", whitespace
-            let after = after
-                .trim_start_matches(|c: char| c == ':' || c == ' ' || c.eq_ignore_ascii_case(&'i') || c.eq_ignore_ascii_case(&'s'));
+            let after = after.trim_start_matches(|c: char| {
+                c == ':' || c == ' ' || c.eq_ignore_ascii_case(&'i') || c.eq_ignore_ascii_case(&'s')
+            });
             let candidate: String = after.chars().take_while(|c| c.is_alphanumeric()).collect();
             if candidate.len() == 5 && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
                 return Some(candidate);
@@ -275,7 +298,8 @@ mod tests {
 
     #[test]
     fn extract_verification_link_html() {
-        let body = r#"<a href="https://store.steampowered.com/creationconfirm?token=xyz">Verify</a>"#;
+        let body =
+            r#"<a href="https://store.steampowered.com/creationconfirm?token=xyz">Verify</a>"#;
         assert_eq!(
             extract_verification_link(body),
             Some("https://store.steampowered.com/creationconfirm?token=xyz".to_string())
@@ -320,6 +344,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_qp_preserves_utf8_bytes() {
+        // "café" in UTF-8, QP-encoded.
+        assert_eq!(decode_quoted_printable("caf=C3=A9"), "café");
+    }
+
+    #[test]
+    fn decode_body_respects_transfer_encoding_header() {
+        let plain = "Content-Type: text/plain\r\n\r\nVisit https://example.com/?a=deadbeef";
+        assert_eq!(decode_body(plain), plain);
+
+        let qp = "Content-Transfer-Encoding: quoted-printable\r\n\r\nfoo=3Dbar";
+        assert_eq!(
+            decode_body(qp),
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\nfoo=bar"
+        );
+    }
+
+    #[test]
     fn no_verification_link() {
         let body = "Hello, this is a regular email with no Steam links.";
         assert_eq!(extract_verification_link(body), None);
@@ -330,5 +372,68 @@ mod tests {
         let server = SteamMailServer::new("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();
         assert_ne!(addr.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn smtp_end_to_end_extracts_guard_code() {
+        let mut server = SteamMailServer::new("127.0.0.1:0").await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+
+        stream
+            .write_all(
+                b"EHLO test\r\n\
+                  MAIL FROM:<sender@example.com>\r\n\
+                  RCPT TO:<guard@example.com>\r\n\
+                  DATA\r\n\
+                  Subject: Steam Guard\r\n\
+                  \r\n\
+                  Your Steam Guard code is: AB12C\r\n\
+                  .\r\n\
+                  QUIT\r\n",
+            )
+            .await
+            .unwrap();
+
+        let code = tokio::time::timeout(std::time::Duration::from_secs(2), server.recv_code())
+            .await
+            .expect("timed out waiting for guard code");
+
+        assert_eq!(code.as_deref(), Some("AB12C"));
+    }
+
+    #[tokio::test]
+    async fn smtp_end_to_end_extracts_verification_link() {
+        let mut server = SteamMailServer::new("127.0.0.1:0").await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+
+        stream
+            .write_all(
+                b"HELO test\r\n\
+                  MAIL FROM:<sender@example.com>\r\n\
+                  RCPT TO:<guard@example.com>\r\n\
+                  DATA\r\n\
+                  Subject: Verify\r\n\
+                  \r\n\
+                  https://store.steampowered.com/account/newaccountverification?stoken=abc&creationid=1\r\n\
+                  .\r\n\
+                  QUIT\r\n",
+            )
+            .await
+            .unwrap();
+
+        let link = tokio::time::timeout(std::time::Duration::from_secs(2), server.recv_link())
+            .await
+            .expect("timed out waiting for verification link");
+
+        assert_eq!(
+            link.as_deref(),
+            Some(
+                "https://store.steampowered.com/account/newaccountverification?stoken=abc&creationid=1"
+            )
+        );
     }
 }

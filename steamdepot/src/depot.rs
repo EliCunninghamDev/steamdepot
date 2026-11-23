@@ -67,15 +67,20 @@ pub async fn prepare_download(
     // Skip app IDs we've already requested this session.
     let mut license_apps = vec![config.app_id];
     for d in &depots {
-        if let Some(from) = d.depot_from_app {
-            if !license_apps.contains(&from) {
-                license_apps.push(from);
-            }
+        if let Some(from) = d.depot_from_app.filter(|from| !license_apps.contains(from)) {
+            license_apps.push(from);
         }
     }
     let is_authenticated = conn.session().map(|s| s.authenticated).unwrap_or(false);
-    let cached = conn.session().map(|s| &s.licensed_appids).cloned().unwrap_or_default();
-    let needed: Vec<u32> = license_apps.into_iter().filter(|id| !cached.contains(id)).collect();
+    let cached = conn
+        .session()
+        .map(|s| &s.licensed_appids)
+        .cloned()
+        .unwrap_or_default();
+    let needed: Vec<u32> = license_apps
+        .into_iter()
+        .filter(|id| !cached.contains(id))
+        .collect();
     // Only attempt free license requests for authenticated sessions.
     // Anonymous sessions cannot claim licenses (Steam silently ignores the request).
     if !needed.is_empty() && is_authenticated {
@@ -145,10 +150,7 @@ pub async fn fetch_manifests(
     plan: &mut DownloadPlan,
     branch: &str,
 ) -> Result<()> {
-    let cell_id = conn
-        .session()
-        .map(|s| s.cell_id)
-        .unwrap_or(0);
+    let cell_id = conn.session().map(|s| s.cell_id).unwrap_or(0);
 
     plan.cdn_servers = cdn::get_cdn_servers(conn, cell_id).await?;
 
@@ -157,11 +159,17 @@ pub async fn fetch_manifests(
     }
 
     // Prefer SteamCache/CDN servers, but keep all for fallback rotation
-    let preferred: Vec<_> = plan.cdn_servers.iter()
+    let preferred: Vec<_> = plan
+        .cdn_servers
+        .iter()
         .filter(|s| s.server_type == "SteamCache" || s.server_type == "CDN")
         .cloned()
         .collect();
-    let servers = if preferred.is_empty() { &plan.cdn_servers } else { &preferred };
+    let servers = if preferred.is_empty() {
+        &plan.cdn_servers
+    } else {
+        &preferred
+    };
 
     for dp in &mut plan.plans {
         let key_app = dp.depot.containing_app(plan.app_id);
@@ -241,7 +249,9 @@ pub async fn fetch_manifests(
             if attempt < MANIFEST_RETRIES {
                 eprintln!(
                     "retrying manifest download for depot {} with next CDN server (attempt {}/{})",
-                    dp.depot.depot_id, attempt + 2, MANIFEST_RETRIES + 1
+                    dp.depot.depot_id,
+                    attempt + 2,
+                    MANIFEST_RETRIES + 1
                 );
             }
         }
@@ -288,11 +298,9 @@ pub fn resolve_depots(
         };
 
         // Filter by OS — no oslist means all platforms.
-        if let Some(KvValue::Children(config)) = depot.get("config") {
-            if let Some(KvValue::String(oslist)) = config.get("oslist") {
-                if !oslist.split(',').any(|o| o.trim() == os) {
-                    continue;
-                }
+        if let Some(oslist) = depot.get("config").and_then(|c| c.get_str("oslist")) {
+            if !oslist.split(',').any(|o| o.trim() == os) {
+                continue;
             }
         }
 
@@ -339,4 +347,116 @@ pub fn resolve_depots(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(buffer: &str) -> pics::AppProductInfo {
+        pics::AppProductInfo {
+            appid: 100,
+            change_number: 1,
+            buffer: buffer.as_bytes().to_vec(),
+        }
+    }
+
+    const APPINFO: &str = r#"
+        "appinfo"
+        {
+            "appid" "100"
+            "depots"
+            {
+                "101"
+                {
+                    "config" { "oslist" "linux, windows" }
+                    "manifests" { "public" "1111" }
+                }
+                "102"
+                {
+                    "config" { "oslist" "macos" }
+                    "manifests" { "public" "2222" }
+                }
+                "103"
+                {
+                    "config" { "oslist" "linux" }
+                    "manifests" { "beta" { "gid" "3333" } "public" "4444" }
+                    "depotfromapp" "999"
+                }
+                "104"
+                {
+                    "manifests" { "public" { "gid" "5555" } }
+                }
+                "105"
+                {
+                    "manifests" { "beta" { "gid" "6666" } }
+                }
+                "notanumber"
+                {
+                    "manifests" { "public" "7777" }
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn resolves_public_branch_for_linux() {
+        let depots = resolve_depots(&app(APPINFO), "linux", "public").unwrap();
+        assert_eq!(
+            depots
+                .iter()
+                .map(|d| (d.depot_id, d.manifest_id))
+                .collect::<Vec<_>>(),
+            vec![(101, 1111), (103, 4444), (104, 5555)]
+        );
+        assert_eq!(depots[1].depot_from_app, Some(999));
+    }
+
+    #[test]
+    fn falls_back_to_public_for_unknown_branch() {
+        let depots = resolve_depots(&app(APPINFO), "linux", "beta").unwrap();
+        assert_eq!(
+            depots
+                .iter()
+                .map(|d| (d.depot_id, d.manifest_id))
+                .collect::<Vec<_>>(),
+            vec![(101, 1111), (103, 3333), (104, 5555), (105, 6666)]
+        );
+    }
+
+    #[test]
+    fn filters_other_platforms() {
+        let depots = resolve_depots(&app(APPINFO), "macos", "public").unwrap();
+        assert_eq!(
+            depots
+                .iter()
+                .map(|d| (d.depot_id, d.manifest_id))
+                .collect::<Vec<_>>(),
+            vec![(102, 2222), (104, 5555)]
+        );
+    }
+
+    #[test]
+    fn missing_depots_section_is_empty() {
+        let depots =
+            resolve_depots(&app(r#""appinfo" { "appid" "1" }"#), "linux", "public").unwrap();
+        assert!(depots.is_empty());
+    }
+
+    #[test]
+    fn missing_appinfo_is_an_error() {
+        assert!(resolve_depots(&app(r#""other" { "x" "y" }"#), "linux", "public").is_err());
+    }
+
+    #[test]
+    fn containing_app_defaults_to_parent() {
+        let mut depot = DepotInfo {
+            depot_id: 10,
+            manifest_id: 20,
+            depot_from_app: None,
+        };
+        assert_eq!(depot.containing_app(42), 42);
+        depot.depot_from_app = Some(7);
+        assert_eq!(depot.containing_app(42), 7);
+    }
 }

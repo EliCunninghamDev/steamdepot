@@ -30,7 +30,11 @@ pub enum Error {
     UnexpectedEMsg { expected: EMsg, got: EMsg },
 
     #[error("steam error: {msg} (EResult {eresult}: {name})")]
-    EResult { eresult: i32, name: &'static str, msg: String },
+    EResult {
+        eresult: i32,
+        name: &'static str,
+        msg: String,
+    },
 
     #[error("no session set")]
     NoSession,

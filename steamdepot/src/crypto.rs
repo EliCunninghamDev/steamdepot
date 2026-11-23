@@ -1,7 +1,7 @@
-use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes256;
+use aes::cipher::{BlockDecrypt, KeyInit};
 use base64::Engine;
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 
 use crate::error::{Error, Result};
 
@@ -16,7 +16,7 @@ pub fn aes_ecb_decrypt(key: &[u8], input: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
-    if input.len() % 16 != 0 {
+    if input.len() & 15 != 0 {
         return Err(Error::Other(format!(
             "encrypted data length {} not a multiple of 16",
             input.len()
@@ -27,20 +27,21 @@ pub fn aes_ecb_decrypt(key: &[u8], input: &[u8]) -> Result<Vec<u8>> {
         Aes256::new_from_slice(key).map_err(|e| Error::Other(format!("AES key init: {}", e)))?;
 
     let mut output = input.to_vec();
-    for block in output.chunks_exact_mut(16) {
-        cipher.decrypt_block(aes::Block::from_mut_slice(block));
+    for i in (0..output.len()).step_by(16) {
+        cipher.decrypt_block(aes::Block::from_mut_slice(&mut output[i..i + 16]));
     }
 
     // Remove PKCS7 padding
     if let Some(&pad_len) = output.last() {
         let pad_len = pad_len as usize;
-        if pad_len > 0 && pad_len <= 16 && output.len() >= pad_len {
-            if output[output.len() - pad_len..]
+        if pad_len > 0
+            && pad_len <= 16
+            && output.len() >= pad_len
+            && output[output.len() - pad_len..]
                 .iter()
                 .all(|&b| b == pad_len as u8)
-            {
-                output.truncate(output.len() - pad_len);
-            }
+        {
+            output.truncate(output.len() - pad_len);
         }
     }
 
@@ -141,4 +142,126 @@ fn aes_ecb_decrypt_block(key: &[u8], block: &[u8]) -> Result<Vec<u8>> {
     output.copy_from_slice(block);
     cipher.decrypt_block(aes::Block::from_mut_slice(&mut output));
     Ok(output.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use aes::Aes256;
+    use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyIvInit};
+
+    use super::*;
+
+    const KEY: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    const IV: [u8; 16] = [0x42; 16];
+
+    fn ecb_encrypt_padded(plaintext: &[u8]) -> Vec<u8> {
+        let cipher = Aes256::new_from_slice(&KEY).unwrap();
+        let mut buf = plaintext.to_vec();
+        let pad = 16 - (buf.len() % 16);
+        buf.extend(std::iter::repeat_n(pad as u8, pad));
+        for i in (0..buf.len()).step_by(16) {
+            cipher.encrypt_block(aes::Block::from_mut_slice(&mut buf[i..i + 16]));
+        }
+        buf
+    }
+
+    fn ecb_encrypt_block(block: &[u8; 16]) -> [u8; 16] {
+        let cipher = Aes256::new_from_slice(&KEY).unwrap();
+        let mut out = *block;
+        cipher.encrypt_block(aes::Block::from_mut_slice(&mut out));
+        out
+    }
+
+    fn cbc_encrypt(plaintext: &[u8], iv: &[u8; 16]) -> Vec<u8> {
+        let enc = cbc::Encryptor::<Aes256>::new_from_slices(&KEY, iv).unwrap();
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        let len = enc
+            .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf, plaintext.len())
+            .unwrap()
+            .len();
+        buf.truncate(len);
+        buf
+    }
+
+    fn steam_symmetric_encrypt(plaintext: &[u8]) -> Vec<u8> {
+        let iv_ct = ecb_encrypt_block(&IV);
+        let body = cbc_encrypt(plaintext, &IV);
+        [iv_ct.as_slice(), body.as_slice()].concat()
+    }
+
+    #[test]
+    fn aes256_ecb_decrypts_nist_vector() {
+        // NIST FIPS-197 AES-256 single-block known answer.
+        let ciphertext = hex("8ea2b7ca516745bfeafc49904b496089");
+        let expected = hex("00112233445566778899aabbccddeeff");
+        assert_eq!(aes_ecb_decrypt(&KEY, &ciphertext).unwrap(), expected);
+    }
+
+    #[test]
+    fn aes256_ecb_strips_pkcs7_padding() {
+        let ciphertext = ecb_encrypt_padded(b"hello steam");
+        assert_eq!(aes_ecb_decrypt(&KEY, &ciphertext).unwrap(), b"hello steam");
+    }
+
+    #[test]
+    fn aes256_cbc_roundtrip() {
+        let plaintext = b"depot content";
+        let ciphertext = cbc_encrypt(plaintext, &IV);
+        assert_eq!(aes_cbc_decrypt(&KEY, &IV, &ciphertext).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn symmetric_decrypt_roundtrip() {
+        let plaintext = b"chunk bytes that are not aligned";
+        let encrypted = steam_symmetric_encrypt(plaintext);
+        assert_eq!(symmetric_decrypt(&KEY, &encrypted).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn decrypt_filename_roundtrip() {
+        let plaintext = b"materials/models/foo.vmt\0\0";
+        let encrypted = steam_symmetric_encrypt(plaintext);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+
+        assert_eq!(
+            decrypt_filename(&KEY, &b64).unwrap(),
+            "materials/models/foo.vmt"
+        );
+    }
+
+    #[test]
+    fn decrypt_filename_ignores_whitespace_in_base64() {
+        let plaintext = b"a/b.txt";
+        let encrypted = steam_symmetric_encrypt(plaintext);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+        let wrapped = format!("{}\n  {}\n", &b64[..8], &b64[8..]);
+
+        assert_eq!(decrypt_filename(&KEY, &wrapped).unwrap(), "a/b.txt");
+    }
+
+    #[test]
+    fn rejects_wrong_key_or_iv_sizes() {
+        assert!(aes_ecb_decrypt(&[0u8; 16], &[0u8; 16]).is_err());
+        assert!(aes_cbc_decrypt(&KEY, &[0u8; 8], &[0u8; 16]).is_err());
+        assert!(aes_cbc_decrypt(&KEY, &IV, &[0u8; 15]).is_err());
+    }
+
+    #[test]
+    fn rejects_unpadded_or_truncated_data() {
+        assert!(aes_ecb_decrypt(&KEY, &[0u8; 15]).is_err());
+        assert!(symmetric_decrypt(&KEY, &[0u8; 31]).is_err());
+        assert!(decrypt_filename(&KEY, "not base64!!").is_err());
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
 }

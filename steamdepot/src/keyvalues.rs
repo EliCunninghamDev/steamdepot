@@ -70,11 +70,10 @@ pub fn parse(input: &[u8]) -> Result<KvValue> {
         Some(pos) => &input[..pos],
         None => input,
     };
-    let text = std::str::from_utf8(trimmed)
-        .map_err(|e| Error::KvParse {
-            offset: e.valid_up_to(),
-            msg: "invalid utf-8".into(),
-        })?;
+    let text = std::str::from_utf8(trimmed).map_err(|e| Error::KvParse {
+        offset: e.valid_up_to(),
+        msg: "invalid utf-8".into(),
+    })?;
     let mut parser = Parser { src: text, pos: 0 };
     let map = parser.parse_map()?;
     Ok(KvValue::Children(map))
@@ -243,5 +242,58 @@ mod tests {
         let input = br#""key" "hello \"world\" \\end""#;
         let root = parse(input).unwrap();
         assert_eq!(root.get_str("key"), Some("hello \"world\" \\end"));
+    }
+
+    #[test]
+    fn parses_unquoted_tokens_and_comments() {
+        let input = b"// leading comment\nkey value // trailing\nother 42\n";
+        let root = parse(input).unwrap();
+        assert_eq!(root.get_str("key"), Some("value"));
+        assert_eq!(root.get_str("other"), Some("42"));
+    }
+
+    #[test]
+    fn strips_trailing_nul_bytes() {
+        let input = b"\"key\" \"value\"\0\0\0";
+        let root = parse(input).unwrap();
+        assert_eq!(root.get_str("key"), Some("value"));
+    }
+
+    #[test]
+    fn handles_utf8_keys_and_values() {
+        let input = "\"café\" \"naïve\"".as_bytes();
+        let root = parse(input).unwrap();
+        assert_eq!(root.get_str("café"), Some("naïve"));
+    }
+
+    #[test]
+    fn duplicate_keys_keep_last_value() {
+        let input = b"\"key\" \"first\" \"key\" \"second\"";
+        let root = parse(input).unwrap();
+        assert_eq!(root.get_str("key"), Some("second"));
+    }
+
+    #[test]
+    fn empty_input_is_empty_map() {
+        let root = parse(b"").unwrap();
+        assert_eq!(root, KvValue::Children(KvMap::new()));
+    }
+
+    #[test]
+    fn reports_unterminated_string() {
+        let err = parse(b"\"key\" \"value").unwrap_err();
+        assert!(matches!(err, Error::KvParse { .. }));
+    }
+
+    #[test]
+    fn reports_missing_closing_brace() {
+        let err = parse(b"\"key\" { \"a\" \"b\"").unwrap_err();
+        assert!(matches!(err, Error::KvParse { .. }));
+    }
+
+    #[test]
+    fn reports_invalid_utf8() {
+        let err = parse(&[0xff, 0xfe]).unwrap_err();
+        assert!(matches!(err, Error::KvParse { .. }));
     }
 }

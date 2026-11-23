@@ -38,6 +38,9 @@ pub struct CmMessage {
 /// Raw parsed frame, before EMsg lookup.
 struct RawFrame {
     emsg_val: u32,
+    /// Whether the frame used protobuf framing. Kept for diagnostics and
+    /// asserted by the framing tests.
+    #[allow(dead_code)]
     is_proto: bool,
     header: CMsgProtoBufHeader,
     body: Vec<u8>,
@@ -49,11 +52,11 @@ pub type SharedSink = Arc<Mutex<WsSink>>;
 /// Connection to a Steam CM server.
 ///
 /// Owns the WebSocket sink (shared via `Arc<Mutex>`) and the read stream.
-/// After login, call [`start_heartbeat`] to spawn a background task.
+/// After login, call [`CmConnection::start_heartbeat`] to spawn a background task.
 ///
-/// Use [`shutdown`] for a clean disconnect (sends `ClientLogOff`, closes the
-/// WebSocket). If dropped without calling `shutdown`, the heartbeat task is
-/// aborted but no logoff is sent.
+/// Use [`CmConnection::shutdown`] for a clean disconnect (sends `ClientLogOff`,
+/// closes the WebSocket). If dropped without calling `shutdown`, the heartbeat
+/// task is aborted but no logoff is sent.
 pub struct CmConnection {
     pub sink: SharedSink,
     stream: CmStream,
@@ -62,12 +65,17 @@ pub struct CmConnection {
 }
 
 impl CmConnection {
-    /// Connect to a CM server's WebSocket endpoint.
+    /// Connect to a CM server.
+    ///
+    /// `endpoint` is either a bare host (`cms1.example.com`), in which case the
+    /// `cmsocket` WebSocket endpoint is used over `wss`, or a complete
+    /// WebSocket URL (for example `ws://127.0.0.1:9000/cmsocket/`, which the
+    /// test suite uses for a local mock CM).
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let url = format!("wss://{}/cmsocket/", endpoint);
+        let url = normalize_ws_url(endpoint);
         let mut config = tungstenite::protocol::WebSocketConfig::default();
-        config.max_frame_size = None;    // unlimited
-        config.max_message_size = None;  // unlimited
+        config.max_frame_size = None; // unlimited
+        config.max_message_size = None; // unlimited
         let (ws, _) =
             tokio_tungstenite::connect_async_with_config(&url, Some(config), false).await?;
         let (sink, stream) = ws.split();
@@ -80,12 +88,7 @@ impl CmConnection {
     }
 
     /// Send a protobuf-framed message.
-    pub async fn send(
-        &self,
-        emsg: EMsg,
-        header: &CMsgProtoBufHeader,
-        body: &[u8],
-    ) -> Result<()> {
+    pub async fn send(&self, emsg: EMsg, header: &CMsgProtoBufHeader, body: &[u8]) -> Result<()> {
         send_raw(&mut *self.sink.lock().await, emsg, header, body).await
     }
 
@@ -100,7 +103,7 @@ impl CmConnection {
     }
 
     /// Start the heartbeat background task.
-    /// Must be called after [`set_session`].
+    /// Must be called after [`CmConnection::set_session`].
     pub fn start_heartbeat(&mut self) {
         let session = match &self.session {
             Some(s) => s,
@@ -180,23 +183,15 @@ impl CmConnection {
     /// `"ContentServerDirectory.GetManifestRequestCode#1"`.
     ///
     /// Returns the raw response body bytes.
-    pub async fn service_method_call(
-        &mut self,
-        method: &str,
-        body: &[u8],
-    ) -> Result<Vec<u8>> {
+    pub async fn service_method_call(&mut self, method: &str, body: &[u8]) -> Result<Vec<u8>> {
         let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut header = self.session_header()?;
         header.target_job_name = Some(method.to_string());
         header.jobid_source = Some(job_id);
 
-        self.send(
-            EMsg::ServiceMethodCallFromClient,
-            &header,
-            body,
-        )
-        .await?;
+        self.send(EMsg::ServiceMethodCallFromClient, &header, body)
+            .await?;
 
         let wait_for_response = async {
             loop {
@@ -241,12 +236,8 @@ impl CmConnection {
             ..Default::default()
         };
 
-        self.send(
-            EMsg::ServiceMethodCallFromClientNonAuthed,
-            &header,
-            body,
-        )
-        .await?;
+        self.send(EMsg::ServiceMethodCallFromClientNonAuthed, &header, body)
+            .await?;
 
         let wait_for_response = async {
             loop {
@@ -298,6 +289,14 @@ impl Drop for CmConnection {
 // Internal framing helpers
 // ---------------------------------------------------------------------------
 
+fn normalize_ws_url(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("wss://{}/cmsocket/", endpoint)
+    }
+}
+
 async fn send_raw(
     sink: &mut WsSink,
     emsg: EMsg,
@@ -343,7 +342,7 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
         // Non-protobuf: ExtendedClientMsgHdr (36 bytes) or MsgHdr (20 bytes).
         // Byte 4 = header_size field for ExtendedClientMsgHdr.
         let hdr_size = data[4] as usize;
-        let skip = if hdr_size >= 20 && hdr_size as usize <= data.len() {
+        let skip = if hdr_size >= 20 && hdr_size <= data.len() {
             hdr_size
         } else {
             // Fallback: assume 20-byte MsgHdr (emsg + 2x jobid)
@@ -363,8 +362,16 @@ fn parse_raw_frame(data: &[u8]) -> Result<RawFrame> {
             CMsgProtoBufHeader {
                 steamid: Some(steamid),
                 client_sessionid: Some(session_id),
-                jobid_target: if target_job != u64::MAX { Some(target_job) } else { None },
-                jobid_source: if source_job != u64::MAX { Some(source_job) } else { None },
+                jobid_target: if target_job != u64::MAX {
+                    Some(target_job)
+                } else {
+                    None
+                },
+                jobid_source: if source_job != u64::MAX {
+                    Some(source_job)
+                } else {
+                    None
+                },
                 ..Default::default()
             }
         } else {
@@ -404,15 +411,14 @@ impl CmStream {
                 None => parse_raw_frame(&self.recv_raw().await?)?,
             };
 
-            if !raw.is_proto {
-                // Don't skip — some Steam responses only come as non-proto
-                // (e.g. ClientPICSProductInfoResponse for authenticated sessions)
-            }
-
             if raw.emsg_val == EMsg::Multi as u32 {
                 self.unpack_multi(&raw.body)?;
                 continue;
             }
+
+            // Non-protobuf frames are parsed too: some Steam responses only
+            // arrive in that form (e.g. ClientPICSProductInfoResponse for
+            // authenticated sessions).
 
             match EMsg::from_u32(raw.emsg_val) {
                 Some(emsg) => {
@@ -420,7 +426,7 @@ impl CmStream {
                         emsg,
                         header: raw.header,
                         body: raw.body,
-                    })
+                    });
                 }
                 None => continue,
             }
@@ -428,43 +434,180 @@ impl CmStream {
     }
 
     fn unpack_multi(&mut self, body: &[u8]) -> Result<()> {
-        let multi = CMsgMulti::decode(body)?;
-        let payload = match (multi.message_body, multi.size_unzipped) {
-            (Some(body), Some(size)) if size > 0 => {
-                let mut decompressed = Vec::with_capacity(size as usize);
-                GzDecoder::new(body.as_slice()).read_to_end(&mut decompressed)?;
-                decompressed
-            }
-            (Some(body), _) => body,
-            (None, _) => return Ok(()),
-        };
-
-        let mut offset = 0;
-        while offset + 4 <= payload.len() {
-            let len =
-                u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += 4;
-            if offset + len > payload.len() {
-                break;
-            }
-            self.queue.push_back(payload[offset..offset + len].to_vec());
-            offset += len;
+        for frame in decode_multi(body)? {
+            self.queue.push_back(frame);
         }
         Ok(())
     }
 
     async fn recv_raw(&mut self) -> Result<Vec<u8>> {
         loop {
-            let msg = self
-                .stream
-                .next()
-                .await
-                .ok_or(Error::ConnectionClosed)??;
+            let msg = self.stream.next().await.ok_or(Error::ConnectionClosed)??;
             match msg {
                 tungstenite::Message::Binary(data) => return Ok(data.into()),
                 tungstenite::Message::Close(_) => return Err(Error::ConnectionClosed),
                 _ => continue,
             }
         }
+    }
+}
+
+/// Decode a `CMsgMulti` envelope into the frames it contains.
+///
+/// The envelope may be gzip-compressed (`size_unzipped` > 0) and contains a
+/// sequence of length-prefixed frames.
+fn decode_multi(body: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let multi = CMsgMulti::decode(body)?;
+    let payload = match (multi.message_body, multi.size_unzipped) {
+        (Some(body), Some(size)) if size > 0 => {
+            let mut decompressed = Vec::with_capacity(size as usize);
+            GzDecoder::new(body.as_slice()).read_to_end(&mut decompressed)?;
+            decompressed
+        }
+        (Some(body), _) => body,
+        (None, _) => return Ok(Vec::new()),
+    };
+
+    Ok(split_multi_payload(&payload))
+}
+
+fn split_multi_payload(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= payload.len() {
+        let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + len > payload.len() {
+            break;
+        }
+        frames.push(payload[offset..offset + len].to_vec());
+        offset += len;
+    }
+    frames
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    use super::*;
+
+    fn proto_frame(emsg: u32, header: &CMsgProtoBufHeader, body: &[u8]) -> Vec<u8> {
+        let header = header.encode_to_vec();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(emsg | PROTO_MASK).to_le_bytes());
+        out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn normalizes_bare_endpoints_and_full_urls() {
+        assert_eq!(
+            normalize_ws_url("cms1.example.com"),
+            "wss://cms1.example.com/cmsocket/"
+        );
+        assert_eq!(
+            normalize_ws_url("ws://127.0.0.1:9000/cmsocket/"),
+            "ws://127.0.0.1:9000/cmsocket/"
+        );
+    }
+
+    #[test]
+    fn parses_protobuf_frame() {
+        let header = CMsgProtoBufHeader {
+            jobid_target: Some(7),
+            steamid: Some(76561198000000000),
+            ..Default::default()
+        };
+        let frame = proto_frame(EMsg::ClientLogOnResponse as u32, &header, b"body");
+
+        let parsed = parse_raw_frame(&frame).unwrap();
+        assert_eq!(parsed.emsg_val, EMsg::ClientLogOnResponse as u32);
+        assert!(parsed.is_proto);
+        assert_eq!(parsed.header.jobid_target, Some(7));
+        assert_eq!(parsed.header.steamid, Some(76561198000000000));
+        assert_eq!(parsed.body, b"body");
+    }
+
+    #[test]
+    fn parses_extended_client_header() {
+        let mut frame = vec![0u8; 36];
+        frame[..4].copy_from_slice(&(EMsg::ClientLogOnResponse as u32).to_le_bytes());
+        frame[4] = 36;
+        frame[7..15].copy_from_slice(&11u64.to_le_bytes());
+        frame[15..23].copy_from_slice(&u64::MAX.to_le_bytes());
+        frame[24..32].copy_from_slice(&76561198000000000u64.to_le_bytes());
+        frame[32..36].copy_from_slice(&42i32.to_le_bytes());
+        frame.extend_from_slice(b"legacy body");
+
+        let parsed = parse_raw_frame(&frame).unwrap();
+        assert_eq!(parsed.emsg_val, EMsg::ClientLogOnResponse as u32);
+        assert!(!parsed.is_proto);
+        assert_eq!(parsed.header.jobid_target, Some(11));
+        assert_eq!(parsed.header.jobid_source, None);
+        assert_eq!(parsed.header.steamid, Some(76561198000000000));
+        assert_eq!(parsed.header.client_sessionid, Some(42));
+        assert_eq!(parsed.body, b"legacy body");
+    }
+
+    #[test]
+    fn rejects_short_and_truncated_frames() {
+        assert!(matches!(
+            parse_raw_frame(&[1, 2, 3]),
+            Err(Error::MessageTooShort(3))
+        ));
+
+        let mut truncated = (EMsg::ClientLogOnResponse as u32 | PROTO_MASK)
+            .to_le_bytes()
+            .to_vec();
+        truncated.extend_from_slice(&100u32.to_le_bytes());
+        assert!(matches!(
+            parse_raw_frame(&truncated),
+            Err(Error::MessageTruncated)
+        ));
+    }
+
+    #[test]
+    fn splits_length_prefixed_multi_payload() {
+        let payload = [
+            3u32.to_le_bytes().as_slice(),
+            b"abc",
+            0u32.to_le_bytes().as_slice(),
+            2u32.to_le_bytes().as_slice(),
+            b"de",
+        ]
+        .concat();
+
+        assert_eq!(
+            split_multi_payload(&payload),
+            vec![b"abc".to_vec(), Vec::new(), b"de".to_vec()]
+        );
+    }
+
+    #[test]
+    fn decodes_gzipped_multi_envelope() {
+        let payload = [3u32.to_le_bytes().as_slice(), b"abc"].concat();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let envelope = CMsgMulti {
+            size_unzipped: Some(payload.len() as u32),
+            message_body: Some(compressed),
+        }
+        .encode_to_vec();
+
+        assert_eq!(decode_multi(&envelope).unwrap(), vec![b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn empty_multi_envelope_has_no_frames() {
+        let envelope = CMsgMulti::default().encode_to_vec();
+        assert!(decode_multi(&envelope).unwrap().is_empty());
     }
 }

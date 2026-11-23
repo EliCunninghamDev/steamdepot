@@ -12,7 +12,7 @@ use steamdepot::download::{self, DownloadProgress, PrepareResult};
 use steamdepot::error::Result;
 use steamdepot::login;
 use steamdepot::pics;
-use steamdepot::proto::{content_manifest_payload, ContentManifestMetadata};
+use steamdepot::proto::{ContentManifestMetadata, content_manifest_payload};
 use steamdepot::steam_api::cm_list::{self, CmServerType};
 
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
@@ -75,6 +75,31 @@ struct Cli {
     /// Refresh token for authenticated login
     #[arg(long)]
     token: Option<String>,
+}
+
+impl Cli {
+    /// Validate option combinations before any network access.
+    fn validate(&self) -> std::result::Result<(), String> {
+        match (&self.username, &self.token) {
+            (Some(_), None) => return Err("--username requires --token".into()),
+            (None, Some(_)) => return Err("--token requires --username".into()),
+            _ => {}
+        }
+
+        if self.depot_id.is_some() != self.depot_app_id.is_some() {
+            return Err("--depot-id and --depot-app-id must be used together".into());
+        }
+
+        if self.fetch_manifests && self.download.is_none() {
+            return Err("--fetch-manifests requires --download".into());
+        }
+
+        if self.install_dir.is_some() && !self.fetch_manifests {
+            return Err("--install-dir requires --fetch-manifests".into());
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +191,9 @@ impl Log {
     fn depot_key(&self, depot_id: u32, app_id: u32, key: &[u8]) {
         let hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
         if self.json() {
-            Self::jline(json!({"type": "depot_key", "depot_id": depot_id, "app_id": app_id, "key": hex}));
+            Self::jline(
+                json!({"type": "depot_key", "depot_id": depot_id, "app_id": app_id, "key": hex}),
+            );
         } else {
             println!("  depot_encryption_key: {}", hex);
         }
@@ -174,7 +201,9 @@ impl Log {
 
     fn plan_start(&self, app_id: u32, os: &str, branch: &str) {
         if self.json() {
-            Self::jline(json!({"type": "plan_start", "app_id": app_id, "os": os, "branch": branch}));
+            Self::jline(
+                json!({"type": "plan_start", "app_id": app_id, "os": os, "branch": branch}),
+            );
         } else {
             println!(
                 "\nPreparing download plan for app {} (os={}, branch={})...",
@@ -208,15 +237,19 @@ impl Log {
             }
         }
         if self.json() {
-            let depots: Vec<_> = plan.plans.iter().map(|dp| {
-                let hex: String = dp.key.iter().map(|b| format!("{:02x}", b)).collect();
-                json!({
-                    "depot_id": dp.depot.depot_id,
-                    "manifest_id": dp.depot.manifest_id,
-                    "key": hex,
-                    "depot_from_app": dp.depot.depot_from_app
+            let depots: Vec<_> = plan
+                .plans
+                .iter()
+                .map(|dp| {
+                    let hex: String = dp.key.iter().map(|b| format!("{:02x}", b)).collect();
+                    json!({
+                        "depot_id": dp.depot.depot_id,
+                        "manifest_id": dp.depot.manifest_id,
+                        "key": hex,
+                        "depot_from_app": dp.depot.depot_from_app
+                    })
                 })
-            }).collect();
+                .collect();
             Self::jline(json!({"type": "plan", "app_id": plan.app_id, "depots": depots}));
         } else {
             println!("  {} depot(s) resolved:\n", plan.plans.len());
@@ -263,10 +296,7 @@ impl Log {
                 "bytes_compressed": meta.cb_disk_compressed.unwrap_or(0)
             }));
         } else {
-            println!(
-                "\n  depot {}  request_code={}",
-                depot_id, request_code
-            );
+            println!("\n  depot {}  request_code={}", depot_id, request_code);
             println!(
                 "    depot_id={} gid_manifest={} creation_time={}",
                 meta.depot_id.unwrap_or(0),
@@ -286,10 +316,7 @@ impl Log {
         }
     }
 
-    fn file_listing(
-        &self,
-        mappings: &[content_manifest_payload::FileMapping],
-    ) {
+    fn file_listing(&self, mappings: &[content_manifest_payload::FileMapping]) {
         if self.json() {
             return;
         }
@@ -322,7 +349,10 @@ impl Log {
                 "install_dir": install_dir.display().to_string()
             }));
         } else {
-            println!("\n    Preparing directory tree in {}...", install_dir.display());
+            println!(
+                "\n    Preparing directory tree in {}...",
+                install_dir.display()
+            );
         }
     }
 
@@ -375,7 +405,10 @@ impl Log {
             if prev != u32::MAX && pct <= prev {
                 return;
             }
-            if last_pct.compare_exchange(prev, pct, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            if last_pct
+                .compare_exchange(prev, pct, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
                 return; // another thread already emitted this threshold
             }
             Self::jline(json!({
@@ -444,6 +477,8 @@ impl Log {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    cli.validate().map_err(steamdepot::error::Error::Other)?;
+
     let log = Log::new(cli.logmode);
     let client = reqwest::Client::new();
 
@@ -464,17 +499,7 @@ async fn main() -> Result<()> {
         (Some(username), Some(token)) => {
             login::login_with_token(&mut conn, username, token).await?
         }
-        (Some(_), None) => {
-            return Err(steamdepot::error::Error::Other(
-                "--username requires --token".into(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(steamdepot::error::Error::Other(
-                "--token requires --username".into(),
-            ));
-        }
-        (None, None) => {
+        _ => {
             let login_id = cli.login_id.unwrap_or_else(login::rand_login_id);
             login::login_anonymous_with_id(&mut conn, login_id).await?
         }
@@ -557,8 +582,7 @@ async fn main() -> Result<()> {
                         let pool = Arc::new(Mutex::new(cdn_pool));
                         log.download_start(plan.cdn_servers.len());
 
-                        let bytes_total =
-                            manifest.metadata.cb_disk_compressed.unwrap_or(0);
+                        let bytes_total = manifest.metadata.cb_disk_compressed.unwrap_or(0);
                         let dl_depot_id = dp.depot.depot_id;
                         let last_pct = Arc::new(AtomicU32::new(u32::MAX));
                         let last_human_time = Arc::new(Mutex::new(Instant::now()));
@@ -572,8 +596,12 @@ async fn main() -> Result<()> {
                             8,
                             move |p| {
                                 log.progress(
-                                    app_id, dl_depot_id, bytes_total, p,
-                                    &last_pct, &last_human_time,
+                                    app_id,
+                                    dl_depot_id,
+                                    bytes_total,
+                                    p,
+                                    &last_pct,
+                                    &last_human_time,
                                 );
                             },
                         )
@@ -589,4 +617,93 @@ async fn main() -> Result<()> {
     log.disconnected();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("steamdepot-cli").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn parses_defaults() {
+        let cli = parse(&["--app-id", "440"]).unwrap();
+        assert_eq!(cli.app_ids, vec![440]);
+        assert_eq!(cli.os, "linux");
+        assert_eq!(cli.branch, "public");
+        assert_eq!(cli.logmode, LogMode::Human);
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn parses_json_logmode_and_repeated_ids() {
+        let cli = parse(&["--logmode", "json", "--app-id", "1", "--app-id", "2"]).unwrap();
+        assert_eq!(cli.logmode, LogMode::Json);
+        assert_eq!(cli.app_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn rejects_unknown_logmode() {
+        assert!(parse(&["--logmode", "xml"]).is_err());
+    }
+
+    #[test]
+    fn requires_username_and_token_together() {
+        let cli = parse(&["--username", "alice"]).unwrap();
+        assert_eq!(cli.validate().unwrap_err(), "--username requires --token");
+
+        let cli = parse(&["--token", "secret"]).unwrap();
+        assert_eq!(cli.validate().unwrap_err(), "--token requires --username");
+    }
+
+    #[test]
+    fn accepts_username_and_token_together() {
+        let cli = parse(&["--username", "alice", "--token", "secret"]).unwrap();
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn requires_matching_depot_arguments() {
+        let cli = parse(&["--depot-id", "123"]).unwrap();
+        assert_eq!(
+            cli.validate().unwrap_err(),
+            "--depot-id and --depot-app-id must be used together"
+        );
+
+        let cli = parse(&["--depot-app-id", "440"]).unwrap();
+        assert!(cli.validate().is_err());
+
+        let cli = parse(&["--depot-id", "123", "--depot-app-id", "440"]).unwrap();
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn requires_download_for_manifest_and_install_options() {
+        let cli = parse(&["--fetch-manifests"]).unwrap();
+        assert_eq!(
+            cli.validate().unwrap_err(),
+            "--fetch-manifests requires --download"
+        );
+
+        let cli = parse(&["--install-dir", "/tmp/x"]).unwrap();
+        assert_eq!(
+            cli.validate().unwrap_err(),
+            "--install-dir requires --fetch-manifests"
+        );
+
+        let cli = parse(&["--download", "440", "--fetch-manifests"]).unwrap();
+        assert!(cli.validate().is_ok());
+
+        let cli = parse(&[
+            "--download",
+            "440",
+            "--fetch-manifests",
+            "--install-dir",
+            "/tmp/x",
+        ])
+        .unwrap();
+        assert!(cli.validate().is_ok());
+    }
 }

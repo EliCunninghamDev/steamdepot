@@ -1,29 +1,41 @@
 [package]
 name = "steamdepot"
-version = "0.3.11"
-edition = "2024"
 description = "Steam depot downloader library — CM connection, authentication, PICS, CDN, and chunk downloading"
-license = "LGPL-2.1-only"
-repository = "https://github.com/EliCunninghamDev/stemdepot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/steamdepot"
+readme = "../README.md"
+keywords = ["steam", "depot", "download", "gamedev"]
+categories = ["api-bindings", "network-programming"]
 
 [dependencies]
-prost = "0.13"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
-futures-util = "0.3"
-flate2 = "1"
-lzma-rs = "0.3"
-aes = "0.8"
-ecb = "0.1"
-cbc = "0.1"
-base64 = "0.22"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-ruzstd = "0.7"
-rsa = "0.9"
+aes.workspace = true
+base64.workspace = true
+cbc.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+lzma-rs.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+rsa.workspace = true
+ruzstd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+zip.workspace = true
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

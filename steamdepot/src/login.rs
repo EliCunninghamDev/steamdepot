@@ -4,14 +4,12 @@ use crate::connection::CmConnection;
 use crate::emsg::EMsg;
 use crate::error::{Error, Result};
 use crate::proto::{
-    c_msg_ip_address, CAuthenticationBeginAuthSessionViaCredentialsRequest,
+    CAuthenticationBeginAuthSessionViaCredentialsRequest,
     CAuthenticationBeginAuthSessionViaCredentialsResponse, CAuthenticationDeviceDetails,
-    CAuthenticationGetPasswordRsaPublicKeyRequest,
-    CAuthenticationGetPasswordRsaPublicKeyResponse,
-    CAuthenticationPollAuthSessionStatusRequest,
-    CAuthenticationPollAuthSessionStatusResponse,
+    CAuthenticationGetPasswordRsaPublicKeyRequest, CAuthenticationGetPasswordRsaPublicKeyResponse,
+    CAuthenticationPollAuthSessionStatusRequest, CAuthenticationPollAuthSessionStatusResponse,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeRequest, CMsgClientLogon,
-    CMsgClientLogonResponse, CMsgIpAddress, CMsgProtoBufHeader,
+    CMsgClientLogonResponse, CMsgIpAddress, CMsgProtoBufHeader, c_msg_ip_address,
 };
 use crate::session::SessionState;
 
@@ -102,10 +100,7 @@ pub struct AuthTokens {
 }
 
 /// Get the RSA public key for encrypting a password.
-pub async fn get_password_rsa_key(
-    conn: &mut CmConnection,
-    account_name: &str,
-) -> Result<RsaKey> {
+pub async fn get_password_rsa_key(conn: &mut CmConnection, account_name: &str) -> Result<RsaKey> {
     let req = CAuthenticationGetPasswordRsaPublicKeyRequest {
         account_name: Some(account_name.to_string()),
     };
@@ -132,8 +127,8 @@ pub fn encrypt_password(password: &str, rsa_key: &RsaKey) -> Result<String> {
     let e = BigUint::parse_bytes(rsa_key.exponent.as_bytes(), 16)
         .ok_or_else(|| Error::Other("invalid RSA exponent".into()))?;
 
-    let pub_key = RsaPublicKey::new(n, e)
-        .map_err(|e| Error::Other(format!("invalid RSA key: {}", e)))?;
+    let pub_key =
+        RsaPublicKey::new(n, e).map_err(|e| Error::Other(format!("invalid RSA key: {}", e)))?;
 
     let mut rng = rsa::rand_core::OsRng;
     let encrypted = pub_key
@@ -278,16 +273,14 @@ pub async fn poll_auth_status(
                 &req.encode_to_vec(),
             )
             .await?;
-        let resp =
-            CAuthenticationPollAuthSessionStatusResponse::decode(resp_bytes.as_slice())?;
+        let resp = CAuthenticationPollAuthSessionStatusResponse::decode(resp_bytes.as_slice())?;
 
-        if let Some(refresh) = resp.refresh_token {
-            if !refresh.is_empty() {
-                return Ok(AuthTokens {
-                    refresh_token: refresh,
-                    access_token: resp.access_token.unwrap_or_default(),
-                });
-            }
+        let refresh = resp.refresh_token.filter(|token| !token.is_empty());
+        if let Some(refresh) = refresh {
+            return Ok(AuthTokens {
+                refresh_token: refresh,
+                access_token: resp.access_token.unwrap_or_default(),
+            });
         }
 
         tokio::time::sleep(std::time::Duration::from_secs_f32(session.interval)).await;
@@ -327,11 +320,11 @@ pub async fn login_with_token(
     conn.send(EMsg::ClientLogon, &header, &body.encode_to_vec())
         .await?;
 
-    let session = await_logon_response(conn).await?;
+    let mut session = await_logon_response(conn).await?;
     // Mark as authenticated so downstream code knows this isn't anonymous.
-    if let Some(s) = conn.session_mut() {
-        s.authenticated = true;
-    }
+    // Update both the stored session and the value returned to the caller.
+    session.authenticated = true;
+    conn.set_session(session.clone());
     Ok(session)
 }
 
@@ -351,10 +344,8 @@ fn extract_steamid_from_jwt(token: &str) -> Option<u64> {
         3 => format!("{}=", payload),
         _ => payload.to_string(),
     };
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &padded,
-    ).ok()?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &padded).ok()?;
     let text = std::str::from_utf8(&decoded).ok()?;
     // Simple extraction: find "sub" : "NNNNN"
     let sub_pos = text.find("\"sub\"")?;
@@ -399,4 +390,92 @@ async fn await_logon_response(conn: &mut CmConnection) -> Result<SessionState> {
 
     conn.set_session(session);
     Ok(conn.session().unwrap().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine;
+    use rsa::traits::PublicKeyParts;
+    use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+
+    use super::*;
+
+    fn jwt_with_payload(payload: &str) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        format!("header.{encoded}.signature")
+    }
+
+    #[test]
+    fn extracts_steamid_from_jwt_payload() {
+        let token = jwt_with_payload(r#"{"iss":"steam","sub":"76561198000000000","exp":1}"#);
+        assert_eq!(
+            extract_steamid_from_jwt(&token),
+            Some(76_561_198_000_000_000)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_jwts() {
+        assert_eq!(extract_steamid_from_jwt("not-a-jwt"), None);
+        assert_eq!(extract_steamid_from_jwt("a.b"), None);
+        assert_eq!(
+            extract_steamid_from_jwt(&jwt_with_payload(r#"{"iss":"steam"}"#)),
+            None
+        );
+        assert_eq!(
+            extract_steamid_from_jwt(&jwt_with_payload(r#"{"sub":"not-a-number"}"#)),
+            None
+        );
+    }
+
+    #[test]
+    fn encrypts_password_with_steam_rsa_format() {
+        let mut rng = rsa::rand_core::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let public = RsaPublicKey::from(&private);
+        let key = RsaKey {
+            modulus: public.n().to_str_radix(16),
+            exponent: public.e().to_str_radix(16),
+            timestamp: 123,
+        };
+
+        let encoded = encrypt_password("hunter2", &key).unwrap();
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let plaintext = private.decrypt(Pkcs1v15Encrypt, &ciphertext).unwrap();
+
+        assert_eq!(plaintext, b"hunter2");
+    }
+
+    #[test]
+    fn encrypt_password_rejects_invalid_key() {
+        let key = RsaKey {
+            modulus: "not-hex".into(),
+            exponent: "010001".into(),
+            timestamp: 0,
+        };
+        assert!(encrypt_password("hunter2", &key).is_err());
+    }
+
+    #[test]
+    fn auth_session_reports_required_guard_type() {
+        let session = AuthSession {
+            client_id: 1,
+            request_id: vec![1, 2, 3],
+            steam_id: 2,
+            allowed_confirmations: vec![GuardType::EmailCode as i32],
+            interval: 5.0,
+        };
+
+        assert!(session.needs_guard(GuardType::EmailCode));
+        assert!(!session.needs_guard(GuardType::DeviceCode));
+    }
+
+    #[test]
+    fn anonymous_steam_id_is_an_anon_user() {
+        // Universe 1 (Public), account type 10 (AnonUser).
+        assert_eq!(ANONYMOUS_STEAM_ID >> 56, 1);
+        assert_eq!((ANONYMOUS_STEAM_ID >> 52) & 0xf, 10);
+    }
 }
